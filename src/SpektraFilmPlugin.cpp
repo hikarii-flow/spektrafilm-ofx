@@ -2238,13 +2238,13 @@ std::filesystem::path bundledUserManualPath() {
   if (contentsPath.empty()) {
     return {};
   }
-  return contentsPath / "Resources" / "spektrafilm_user_manual.pdf";
+  return contentsPath / "Resources" / "manual.pdf";
 }
 
 bool openBundledUserManual(std::string &error) {
   const std::filesystem::path manualPath = bundledUserManualPath();
   if (manualPath.empty() || !std::filesystem::is_regular_file(manualPath)) {
-    error = "Could not find spektrafilm_user_manual.pdf in the OFX bundle resources.";
+    error = "Could not find manual.pdf in the OFX bundle resources.";
     return false;
   }
 

@@ -193,6 +193,7 @@ function(add_spektra_ofx_plugin target artifact_name display_name plugin_id flav
     COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/icons"
     COMMAND "${CMAKE_COMMAND}" -E rm -f
             "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/SpektraFilm_User_Manual.pdf"
+            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/spektrafilm_user_manual.pdf"
             "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/org.spektrafilm.ofx.png"
             "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/org.spektrafilm.pro.png"
             "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/Legal/SPEKTRA_OFX_LICENSE.txt"
@@ -217,7 +218,7 @@ function(add_spektra_ofx_plugin target artifact_name display_name plugin_id flav
             "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/SpektraHanatos2025Spectra.f32"
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different
             "${SPEKTRAFILM_USER_MANUAL_PDF}"
-            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/spektrafilm_user_manual.pdf"
+            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/manual.pdf"
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different
             "${SPEKTRAFILM_OFX_LICENSE}"
             "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/Legal/SPEKTRAFILM_OFX_LICENSE.txt"
@@ -256,6 +257,7 @@ function(add_spektra_ofx_plugin target artifact_name display_name plugin_id flav
     COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/icons"
     COMMAND "${CMAKE_COMMAND}" -E rm -f
             "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/SpektraFilm_User_Manual.pdf"
+            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/spektrafilm_user_manual.pdf"
             "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/org.spektrafilm.ofx.png"
             "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/org.spektrafilm.pro.png"
             "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/Legal/SPEKTRA_OFX_LICENSE.txt"
@@ -280,7 +282,7 @@ function(add_spektra_ofx_plugin target artifact_name display_name plugin_id flav
             "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/SpektraHanatos2025Spectra.f32"
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different
             "${SPEKTRAFILM_USER_MANUAL_PDF}"
-            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/spektrafilm_user_manual.pdf"
+            "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/manual.pdf"
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different
             "${SPEKTRAFILM_OFX_LICENSE}"
             "$<TARGET_BUNDLE_CONTENT_DIR:${target}>/Resources/Legal/SPEKTRAFILM_OFX_LICENSE.txt"
@@ -325,6 +327,7 @@ function(add_spektra_ofx_plugin target artifact_name display_name plugin_id flav
       COMMAND "${CMAKE_COMMAND}" -E rm -f "${download_zip}"
       COMMAND "${CMAKE_COMMAND}" -E rm -rf "${download_stage}"
       COMMAND "${CMAKE_COMMAND}" -E make_directory "${download_stage}"
+      COMMAND "${CMAKE_COMMAND}" -E make_directory "${download_stage}/Legal"
       COMMAND "${CMAKE_COMMAND}" -E copy_directory
               "$<TARGET_BUNDLE_DIR:${target}>"
               "${download_stage}/${artifact_name}.ofx.bundle"
@@ -332,21 +335,24 @@ function(add_spektra_ofx_plugin target artifact_name display_name plugin_id flav
               "${SPEKTRAFILM_OFX_INSTALL_INSTRUCTIONS}"
               "${download_stage}/install_instructions.txt"
       COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+              "${SPEKTRAFILM_USER_MANUAL_PDF}"
+              "${download_stage}/manual.pdf"
+      COMMAND "${CMAKE_COMMAND}" -E copy_if_different
               "${SPEKTRAFILM_OFX_LICENSE}"
-              "${download_stage}/SPEKTRAFILM_OFX_LICENSE.txt"
+              "${download_stage}/Legal/SPEKTRAFILM_OFX_LICENSE.txt"
       COMMAND "${CMAKE_COMMAND}" -E copy_if_different
               "${SPEKTRAFILM_OFX_LUT_LICENSE}"
-              "${download_stage}/SPEKTRAFILM_OFX_LUT_LICENSE.txt"
+              "${download_stage}/Legal/SPEKTRAFILM_OFX_LUT_LICENSE.txt"
       COMMAND "${CMAKE_COMMAND}" -E copy_if_different
               "${SPEKTRAFILM_OFX_THIRD_PARTY_NOTICES}"
-              "${download_stage}/THIRD_PARTY_NOTICES.txt"
+              "${download_stage}/Legal/THIRD_PARTY_NOTICES.txt"
       COMMAND "${CMAKE_COMMAND}" -E env COPYFILE_DISABLE=1 /usr/bin/ditto
               -c
               -k
               --norsrc
               "${download_stage}"
               "${download_zip}"
-      DEPENDS ${target}BundleResources "${SPEKTRAFILM_OFX_INSTALL_INSTRUCTIONS}"
+      DEPENDS ${target}BundleResources "${SPEKTRAFILM_OFX_INSTALL_INSTRUCTIONS}" "${SPEKTRAFILM_USER_MANUAL_PDF}"
       VERBATIM
     )
   endif()

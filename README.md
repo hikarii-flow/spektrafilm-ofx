@@ -259,6 +259,9 @@ website/public/downloads/spektrafilm_flow-OFX-macOS.zip
 website/public/downloads/spektrafilm-OFX-macOS.zip
 ```
 
+Each ZIP contains the OFX bundle, `install_instructions.txt`, a root-level
+`manual.pdf`, and the distribution notices under `Legal/`.
+
 The `spektrafilm dev` development flavor is built as a local target, but the default
 download packaging script does not create a `spektrafilm_dev` ZIP by default as it is not intended for distribution but internal validation only.
 

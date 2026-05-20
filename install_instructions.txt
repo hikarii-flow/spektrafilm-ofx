@@ -17,11 +17,11 @@ plugin folder.
 
 
 User manual & reference guide
-===============================
+==============================
 
-You can find plugin-relevant documentation either at:
+You can find plugin-relevant documentation at the root of this ZIP. The same manual is also bundled inside the installed plugin at:
 
-  /spektrafilm.ofx.bundle/Contents/Resources/spektrafilm_user_manual.pdf
+  /spektrafilm.ofx.bundle/Contents/Resources/manual.pdf
 
 or by selecting "Open User Manual" from the "Manage" section in the plugin interface.
 
