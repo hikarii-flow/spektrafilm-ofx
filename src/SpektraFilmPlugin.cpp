@@ -2961,6 +2961,15 @@ double filmFormatMm(spektrafilm::FilmFormat format) {
   }
 }
 
+double grainFinalBlurFormatScale(spektrafilm::FilmFormat format) {
+  return std::pow(std::max(filmFormatMm(format) / 35.0, 1.0e-6), 0.62);
+}
+
+double effectiveGrainFinalBlurUm(const spektrafilm::RenderParams &params) {
+  return std::max(static_cast<double>(params.grainFinalBlurUm), 0.0) *
+    grainFinalBlurFormatScale(params.filmFormat);
+}
+
 double enlargerScale(const spektrafilm::RenderParams &params) {
   return std::clamp(static_cast<double>(params.enlargerScale), 1.0, 32.0);
 }
@@ -3169,10 +3178,10 @@ int grainRadiusPixels(const spektrafilm::RenderParams &params, double pixelSizeU
   if (params.grainModel == spektrafilm::GrainModel::GrainSynthesis && pixelSizeUm > 0.0) {
     const double supportUm = grainSynthesisMaxRadiusUm(params) +
       3.0 * grainSynthesisObservationSigmaUm(params);
-    return clampedKernelRadius(supportUm / pixelSizeUm, 256);
+    return clampedKernelRadius(std::max(supportUm, effectiveGrainFinalBlurUm(params)) / pixelSizeUm, 256);
   }
   double maxSigmaPixels = pixelSizeUm > 0.0
-    ? std::max(static_cast<double>(params.grainFinalBlurUm), 0.0) / pixelSizeUm
+    ? effectiveGrainFinalBlurUm(params) / pixelSizeUm
     : 0.0;
   if (params.grainModel == spektrafilm::GrainModel::Production && pixelSizeUm > 0.0) {
     maxSigmaPixels = std::max(maxSigmaPixels, static_cast<double>(params.grainBlurDyeCloudsUm) / pixelSizeUm);
@@ -3539,7 +3548,7 @@ OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHandle) {
   defineDouble3D(paramSet, "grainParticleScaleLayers", "Layer Scale", 6.0, 1.0, 0.4, "grainGroup");
   defineDouble3D(paramSet, "grainDensityMin", "Density Min", 0.04, 0.05, 0.06, "grainGroup");
   defineDouble3D(paramSet, "grainUniformity", "Uniformity RGB", 0.99, 0.97, 0.98, "grainGroup");
-  defineDouble(paramSet, "grainFinalBlurUm", "Final Grain Blur um", 7.17, 0.0, 25.0, "grainGroup");
+  defineDouble(paramSet, "grainFinalBlurUm", "Final Grain Blur", 7.17, 0.0, 25.0, "grainGroup");
   defineDouble(paramSet, "grainBlurDyeCloudsUm", "Dye Cloud Blur um", 1.0, 0.0, 10.0, "grainGroup");
   defineDouble2D(paramSet, "grainMicroStructure", "Micro Structure", 0.2, 30.0, "grainGroup");
   defineInt(paramSet, "grainSeed", "Seed", 1, 0, 1000000, "grainGroup");

@@ -93,7 +93,7 @@ inline constexpr TooltipEntry kTooltipEntries[] = {
   {"grainParticleScaleLayers", "Particle-size multipliers for the three emulsion depth layers."},
   {"grainDensityMin", "Minimum per-channel grain density contribution."},
   {"grainUniformity", "Higher values make grain more even; lower values increase clumping."},
-  {"grainFinalBlurUm", "Final film-plane blur applied to synthesized grain density, in micrometers."},
+  {"grainFinalBlurUm", "35mm-equivalent final grain blur, format-compensated for the selected film size."},
   {"grainBlurDyeCloudsUm", "Physical dye-cloud blur used by production grain, in micrometers."},
   {"grainMicroStructure", "Fine grain modulation: X controls strength, Y controls structure wavelength in nm."},
   {"grainSeed", "Random seed for repeatable grain patterns."},

@@ -298,6 +298,33 @@ static int2 spektra_film_um_to_output_pixel(
   return int2(floor(outputUv * safeDims));
 }
 
+static float spektra_film_format_mm(int format) {
+  switch (format) {
+    case 0:
+      return 4.8;
+    case 1:
+      return 5.79;
+    case 2:
+      return 10.26;
+    case 3:
+      return 12.52;
+    case 5:
+      return 24.89;
+    case 6:
+      return 52.48;
+    case 7:
+      return 70.41;
+    case 4:
+    default:
+      return 35.0;
+  }
+}
+
+static float spektra_grain_final_blur_um(constant SpektraKernelParams &params) {
+  const float formatScale = pow(max(spektra_film_format_mm(params.filmFormat) / 35.0, 1.0e-6), 0.62);
+  return max(params.grainFinalBlurUm, 0.0) * formatScale;
+}
+
 static float spektra_gaussian(uint seed) {
   const float u1 = max(spektra_rand01(seed), 1.0e-6);
   const float u2 = spektra_rand01(seed ^ 0x9e3779b9u);
@@ -617,7 +644,7 @@ static float3 spektra_preview_grain_density(
 ) {
   float3 outDensity = densityCmy;
   const float pixelArea = max(params.filmPixelSizeUm * params.filmPixelSizeUm, 1.0e-6);
-  const float finalBlurPx = max(params.grainFinalBlurUm, 0.0) / max(params.filmPixelSizeUm, 1.0e-6);
+  const float finalBlurPx = spektra_grain_final_blur_um(params) / max(params.filmPixelSizeUm, 1.0e-6);
   const float blurDamping = rsqrt(1.0 + 0.35 * finalBlurPx + 0.12 * max(params.grainBlurDyeCloudsUm, 0.0));
   const uint layerCount = params.grainSublayersEnabled != 0 ? 3u : uint(clamp(params.grainSubLayerCount, 1, 8));
 
@@ -710,7 +737,7 @@ static float3 spektra_production_grain_density(
 
   float3 outDensity = float3(0.0);
   const float pixelArea = max(params.filmPixelSizeUm * params.filmPixelSizeUm, 1.0e-6);
-  const float finalBlurPx = max(params.grainFinalBlurUm, 0.0) / max(params.filmPixelSizeUm, 1.0e-6);
+  const float finalBlurPx = spektra_grain_final_blur_um(params) / max(params.filmPixelSizeUm, 1.0e-6);
   const float blurDamping = rsqrt(1.0 + 0.12 * max(params.grainBlurDyeCloudsUm, 0.0) + 0.35 * finalBlurPx);
 
   for (uint channel = 0u; channel < 3u; ++channel) {
@@ -4892,7 +4919,7 @@ kernel void spektrafilm_grain_density_blur_x(
     return;
   }
   const uint index = gid.y * dims.x + gid.x;
-  const float sigma = max(params.grainFinalBlurUm, 0.0) / max(params.filmPixelSizeUm, 1.0e-6);
+  const float sigma = spektra_grain_final_blur_um(params) / max(params.filmPixelSizeUm, 1.0e-6);
   if (sigma <= 0.0 || (params.grainSublayersEnabled == 0u && sigma <= 0.4)) {
     densityOut[index] = densityIn[index];
     return;
@@ -4919,7 +4946,7 @@ kernel void spektrafilm_grain_density_blur_y(
     return;
   }
   const uint index = gid.y * dims.x + gid.x;
-  const float sigma = max(params.grainFinalBlurUm, 0.0) / max(params.filmPixelSizeUm, 1.0e-6);
+  const float sigma = spektra_grain_final_blur_um(params) / max(params.filmPixelSizeUm, 1.0e-6);
   if (sigma <= 0.0 || (params.grainSublayersEnabled == 0u && sigma <= 0.4)) {
     densityOut[index] = densityIn[index];
     return;
