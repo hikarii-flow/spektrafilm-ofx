@@ -7,6 +7,10 @@ endif()
 
 project(SpektraFilmOFX LANGUAGES CXX)
 
+if(WIN32)
+  set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
+
 set(SPEKTRAFILM_USE_VULKAN OFF)
 if(APPLE)
   enable_language(OBJCXX)
@@ -23,8 +27,8 @@ else()
 endif()
 
 # Define platform-specific version variables that can be overridden via command line
-set(SPEKTRAFILM_MACOS_VERSION "0.2.6" CACHE STRING "Version number for macOS release")
-set(SPEKTRAFILM_WINDOWS_VERSION "0.1.7" CACHE STRING "Version number for Windows release")
+set(SPEKTRAFILM_MACOS_VERSION "0.2.7" CACHE STRING "Version number for macOS release")
+set(SPEKTRAFILM_WINDOWS_VERSION "0.1.8" CACHE STRING "Version number for Windows release")
 set(SPEKTRAFILM_LINUX_VERSION "${SPEKTRAFILM_WINDOWS_VERSION}" CACHE STRING "Version number for Linux developer builds")
 
 # Set the active version based on the target OS
@@ -51,8 +55,10 @@ endif()
 option(SPEKTRAFILM_NATIVE_FAST_MATH "Build native macOS renderer code with -ffast-math. Candidate optimization; validate with parity before release." OFF)
 option(SPEKTRAFILM_METAL_FAST_MATH "Build Metal shaders with -ffast-math. Candidate optimization; validate with parity before release." OFF)
 option(SPEKTRAFILM_METAL_PROFILE_SOURCES "Build Metal shader library with source/debug info for Xcode Metal profiling. Do not enable for release builds." OFF)
-option(SPEKTRAFILM_OFX_METAL_GPU_BUFFERS "Advertise experimental OFX Metal GPU buffer renders on macOS. CPU rendering remains the fallback." OFF)
+option(SPEKTRAFILM_OFX_METAL_GPU_BUFFERS "Advertise OFX Metal GPU buffer renders on macOS. CPU rendering remains the fallback." ON)
+option(SPEKTRAFILM_RELEASE_LTO "Enable interprocedural optimization for Release native targets when supported." ON)
 set(SPEKTRAFILM_METAL_LANGUAGE_STANDARD "macos-metal2.3" CACHE STRING "Metal language standard used to build SpektraFilm.metallib.")
+set(SPEKTRAFILM_METAL_OPTIMIZATION_LEVEL "-O3" CACHE STRING "Optimization level passed to the Metal shader compiler.")
 set(SPEKTRAFILM_METAL_EXTRA_FLAGS "" CACHE STRING "Extra flags passed to the Metal shader compiler.")
 if(APPLE)
   set(SPEKTRAFILM_MACOS_LOCAL_CODESIGN_IDENTITY "-" CACHE STRING "Code signing identity for local macOS OFX bundles. Set empty to disable. Release packaging re-signs staged bundles with Developer ID.")
@@ -97,6 +103,14 @@ endif()
 set(_SPEKTRAFILM_VULKAN_SDK "")
 if(SPEKTRAFILM_USE_VULKAN AND DEFINED ENV{VULKAN_SDK})
   file(TO_CMAKE_PATH "$ENV{VULKAN_SDK}" _SPEKTRAFILM_VULKAN_SDK)
+endif()
+
+if(SPEKTRAFILM_RELEASE_LTO AND (APPLE OR SPEKTRAFILM_USE_VULKAN))
+  include(CheckIPOSupported)
+  check_ipo_supported(RESULT SPEKTRAFILM_RELEASE_LTO_SUPPORTED OUTPUT SPEKTRAFILM_RELEASE_LTO_ERROR LANGUAGES CXX)
+  if(NOT SPEKTRAFILM_RELEASE_LTO_SUPPORTED)
+    message(WARNING "Release LTO is unavailable and will be disabled: ${SPEKTRAFILM_RELEASE_LTO_ERROR}")
+  endif()
 endif()
 
 if(APPLE)
@@ -237,6 +251,9 @@ if(APPLE)
   set(SPEKTRAFILM_METALLIB "${CMAKE_CURRENT_BINARY_DIR}/SpektraFilm.metallib")
   set(SPEKTRAFILM_METAL_MODULE_CACHE "${CMAKE_CURRENT_BINARY_DIR}/metal-module-cache")
   set(SPEKTRAFILM_METAL_COMPILE_FLAGS)
+  if(SPEKTRAFILM_METAL_OPTIMIZATION_LEVEL)
+    list(APPEND SPEKTRAFILM_METAL_COMPILE_FLAGS "${SPEKTRAFILM_METAL_OPTIMIZATION_LEVEL}")
+  endif()
   if(SPEKTRAFILM_METAL_FAST_MATH)
     list(APPEND SPEKTRAFILM_METAL_COMPILE_FLAGS -ffast-math)
   endif()
@@ -393,6 +410,12 @@ function(apply_spektra_macos_native_options target)
     target_compile_options(${target} PRIVATE
       "$<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>"
     )
+    if(SPEKTRAFILM_RELEASE_LTO AND SPEKTRAFILM_RELEASE_LTO_SUPPORTED)
+      set_property(TARGET ${target} PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+      target_compile_options(${target} PRIVATE
+        "$<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:OBJCXX>>:-flto=thin>"
+      )
+    endif()
     if(SPEKTRAFILM_NATIVE_FAST_MATH)
       target_compile_options(${target} PRIVATE
         "$<$<COMPILE_LANGUAGE:CXX>:-ffast-math>"
@@ -400,6 +423,12 @@ function(apply_spektra_macos_native_options target)
       )
       target_compile_definitions(${target} PRIVATE SPEKTRAFILM_NATIVE_FAST_MATH=1)
     endif()
+  endif()
+endfunction()
+
+function(apply_spektra_release_lto target)
+  if(SPEKTRAFILM_RELEASE_LTO AND SPEKTRAFILM_RELEASE_LTO_SUPPORTED)
+    set_property(TARGET ${target} PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
   endif()
 endfunction()
 
@@ -440,6 +469,7 @@ function(configure_spektra_target target artifact_name display_name plugin_id fl
   )
 
   if(SPEKTRAFILM_USE_VULKAN)
+    apply_spektra_release_lto(${target})
     if(WIN32)
       target_compile_definitions(${target} PRIVATE
         NOMINMAX
@@ -975,6 +1005,7 @@ elseif(SPEKTRAFILM_USE_VULKAN)
   endif()
 
   target_link_libraries(SpektraVulkanCopyHarness PRIVATE Vulkan::Vulkan)
+  apply_spektra_release_lto(SpektraVulkanCopyHarness)
   if(NOT WIN32)
     target_link_libraries(SpektraVulkanCopyHarness PRIVATE ${CMAKE_DL_LIBS})
   endif()

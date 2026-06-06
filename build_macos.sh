@@ -2,14 +2,25 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BUILD_DIR="${SCRIPT_DIR}/build"
+BUILD_DIR="${SCRIPT_DIR}/build-release"
 BUILD_TYPE="${CMAKE_BUILD_TYPE:-Release}"
-CMAKE_ARGS=()
+CMAKE_ARGS=(
+  "-DSPEKTRAFILM_RELEASE_LTO=ON"
+  "-DSPEKTRAFILM_METAL_OPTIMIZATION_LEVEL=-O3"
+  "-DSPEKTRAFILM_METAL_PROFILE_SOURCES=OFF"
+  "-DSPEKTRAFILM_NATIVE_FAST_MATH=OFF"
+  "-DSPEKTRAFILM_METAL_FAST_MATH=OFF"
+  "-DSPEKTRAFILM_OFX_METAL_GPU_BUFFERS=ON"
+)
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --metal-gpu-buffers)
       CMAKE_ARGS+=("-DSPEKTRAFILM_OFX_METAL_GPU_BUFFERS=ON")
+      shift
+      ;;
+    --no-metal-gpu-buffers)
+      CMAKE_ARGS+=("-DSPEKTRAFILM_OFX_METAL_GPU_BUFFERS=OFF")
       shift
       ;;
     -D*|-G*|-A*|-T*)
@@ -46,7 +57,7 @@ if ! xcrun -sdk macosx metal -v >/dev/null 2>&1; then
 fi
 
 cmake -S "${SCRIPT_DIR}" -B "${BUILD_DIR}" -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" "${CMAKE_ARGS[@]}"
-cmake --build "${BUILD_DIR}" --parallel
+cmake --build "${BUILD_DIR}" --config "${BUILD_TYPE}" --parallel
 
 echo "Built spektrafilm flow, spektrafilm, and spektrafilm dev OFX bundles in ${BUILD_DIR} (${BUILD_TYPE})"
 echo "For the signed public installer ZIP, run:"

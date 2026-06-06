@@ -1290,19 +1290,21 @@ static float spektra_interp_density_curve(
     return 0.0;
   }
 
+  device const float2 *curveExposure = (device const float2 *)logExposure;
   const float gamma = max(gammaFactor, 1.0e-6);
-  const float firstX = logExposure[0] / gamma;
-  const float lastX = logExposure[count - 1u] / gamma;
-  if (logRaw <= firstX) {
+  const float lookupRaw = gammaFactor == 1.0 ? logRaw : logRaw * gamma;
+  const float firstX = curveExposure[0].x;
+  const float lastX = curveExposure[count - 1u].x;
+  if (lookupRaw <= firstX) {
     return densityCurves[channel];
   }
-  if (logRaw >= lastX) {
+  if (lookupRaw >= lastX) {
     return densityCurves[(count - 1u) * 3u + channel];
   }
 
   if (smoothInterpolation == 0u && lookupMode != 0u && count > 1u) {
     const float indexF = clamp(
-      (logRaw - firstX) * float(count - 1u) / max(lastX - firstX, 1.0e-9),
+      (lookupRaw - firstX) * float(count - 1u) / max(lastX - firstX, 1.0e-9),
       0.0,
       float(count - 1u)
     );
@@ -1321,34 +1323,32 @@ static float spektra_interp_density_curve(
   uint hi = count - 1u;
   while (hi - lo > 1u) {
     const uint mid = (lo + hi) >> 1u;
-    const float x = logExposure[mid] / gamma;
-    if (x <= logRaw) {
+    if (curveExposure[mid].x <= lookupRaw) {
       lo = mid;
     } else {
       hi = mid;
     }
   }
 
-  const float x0 = logExposure[lo] / gamma;
-  const float x1 = logExposure[hi] / gamma;
+  const float x0 = curveExposure[lo].x;
+  const float x1 = curveExposure[hi].x;
+  const float inverseDx0 = curveExposure[lo].y;
   const float y0 = densityCurves[lo * 3u + channel];
   const float y1 = densityCurves[hi * 3u + channel];
-  const float t = clamp((logRaw - x0) / max(x1 - x0, 1.0e-9), 0.0, 1.0);
+  const float t = clamp((lookupRaw - x0) * inverseDx0, 0.0, 1.0);
   if (smoothInterpolation != 0u && count > 2u) {
     const float dx0 = max(x1 - x0, 1.0e-9);
-    const float d0 = (y1 - y0) / dx0;
+    const float d0 = (y1 - y0) * inverseDx0;
     float m0 = d0;
     float m1 = d0;
     if (lo > 0u) {
-      const float xPrev = logExposure[lo - 1u] / gamma;
       const float yPrev = densityCurves[(lo - 1u) * 3u + channel];
-      const float dPrev = (y0 - yPrev) / max(x0 - xPrev, 1.0e-9);
+      const float dPrev = (y0 - yPrev) * curveExposure[lo - 1u].y;
       m0 = dPrev * d0 > 0.0 ? 0.5 * (dPrev + d0) : 0.0;
     }
     if (hi + 1u < count) {
-      const float xNext = logExposure[hi + 1u] / gamma;
       const float yNext = densityCurves[(hi + 1u) * 3u + channel];
-      const float dNext = (yNext - y1) / max(xNext - x1, 1.0e-9);
+      const float dNext = (yNext - y1) * curveExposure[hi].y;
       m1 = dNext * d0 > 0.0 ? 0.5 * (dNext + d0) : 0.0;
     }
     if (abs(d0) <= 1.0e-9) {
@@ -1372,7 +1372,7 @@ static float spektra_interp_density_curve(
 static float3 spektra_hanatos_raw(
   float3 xyz,
   constant SpektraSpectralInfo &info,
-  device const float *hanatosRawResponseLut
+  device const float4 *hanatosRawResponseLut
 ) {
   const float b = xyz.x + xyz.y + xyz.z;
   const float2 xy = clamp(xyz.xy / max(b, 1.0e-10), float2(0.0), float2(1.0));
@@ -1405,12 +1405,7 @@ static float3 spektra_hanatos_raw(
       const uint yj = spektra_safe_index(yBase - 1 + int(j), info.hanatosHeight);
       const float weight = wx[i] * wy[j];
       weightSum += weight;
-      const uint lutOffset = (xi * info.hanatosHeight + yj) * 3u;
-      raw += weight * float3(
-        hanatosRawResponseLut[lutOffset],
-        hanatosRawResponseLut[lutOffset + 1u],
-        hanatosRawResponseLut[lutOffset + 2u]
-      );
+      raw += weight * hanatosRawResponseLut[xi * info.hanatosHeight + yj].xyz;
     }
   }
   if (weightSum != 0.0) {
@@ -1447,10 +1442,11 @@ static float3 spektra_film_raw_from_decoded(
     raw = spektra_mallett_raw(srgb, mallettBasisIlluminant);
   } else {
     const float3 xyz = spektra_mul_color_matrix(decoded, params.inputColorSpace, colorInfo, inputToReferenceXyz);
+    device const float4 *packedHanatosSpectraLut = (device const float4 *)hanatosSpectraLut;
     const uint compressedOffset = spektra_color_adaptation_enabled(params, kSpektraColorAdaptationInputCompression)
-      ? info.hanatosWidth * info.hanatosHeight * 3u
+      ? info.hanatosWidth * info.hanatosHeight
       : 0u;
-    raw = spektra_hanatos_raw(xyz, info, hanatosSpectraLut + compressedOffset);
+    raw = spektra_hanatos_raw(xyz, info, packedHanatosSpectraLut + compressedOffset);
   }
   return max(raw * exp2(params.filmExposureEv + params.autoExposureEv), float3(0.0));
 }
@@ -1535,7 +1531,7 @@ static float3 spektra_film_log_raw_linear_srgb(
     raw = spektra_mallett_raw(rgb, mallettBasisIlluminant);
   } else {
     const float3 xyz = spektra_mul_color_matrix(rgb, kLinearSrgbColorSpace, colorInfo, inputToReferenceXyz);
-    raw = spektra_hanatos_raw(xyz, info, hanatosSpectraLut);
+    raw = spektra_hanatos_raw(xyz, info, (device const float4 *)hanatosSpectraLut);
   }
   return log10(max(raw, float3(0.0)) + float3(1.0e-10));
 }

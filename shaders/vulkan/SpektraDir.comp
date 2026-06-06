@@ -34,7 +34,7 @@ layout(std430, binding = 3) buffer Buffer3 {
 };
 
 layout(std430, binding = 4) readonly buffer LogExposure {
-  float logExposure[];
+  vec2 curveExposure[];
 };
 
 layout(std430, binding = 5) readonly buffer DensityCurves {
@@ -132,13 +132,13 @@ float interpDensityCurve(float logRaw, uint channel) {
   if (count == 0u) {
     return 0.0;
   }
-  const float gamma = max(params.filmGamma, 1.0e-6);
-  const float firstX = logExposure[0] / gamma;
-  const float lastX = logExposure[count - 1u] / gamma;
-  if (logRaw <= firstX) {
+  const float lookupRaw = params.filmGamma == 1.0 ? logRaw : logRaw * max(params.filmGamma, 1.0e-6);
+  const float firstX = curveExposure[0].x;
+  const float lastX = curveExposure[count - 1u].x;
+  if (lookupRaw <= firstX) {
     return densityCurves[channel];
   }
-  if (logRaw >= lastX) {
+  if (lookupRaw >= lastX) {
     return densityCurves[(count - 1u) * 3u + channel];
   }
 
@@ -146,19 +146,17 @@ float interpDensityCurve(float logRaw, uint channel) {
   uint hi = count - 1u;
   while (hi - lo > 1u) {
     const uint mid = (lo + hi) >> 1u;
-    const float x = logExposure[mid] / gamma;
-    if (x <= logRaw) {
+    if (curveExposure[mid].x <= lookupRaw) {
       lo = mid;
     } else {
       hi = mid;
     }
   }
 
-  const float x0 = logExposure[lo] / gamma;
-  const float x1 = logExposure[hi] / gamma;
+  const float x0 = curveExposure[lo].x;
   const float y0 = densityCurves[lo * 3u + channel];
   const float y1 = densityCurves[hi * 3u + channel];
-  const float t = clamp((logRaw - x0) / max(x1 - x0, 1.0e-9), 0.0, 1.0);
+  const float t = clamp((lookupRaw - x0) * curveExposure[lo].y, 0.0, 1.0);
   return mix(y0, y1, t);
 }
 

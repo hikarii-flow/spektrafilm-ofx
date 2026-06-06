@@ -573,6 +573,72 @@ std::array<float, 3> densityCurveMaximums(const ProfileCurveSet &curves) {
   return maximums;
 }
 
+std::vector<float> makePackedCurveExposure(const float *logExposure, uint32_t exposureCount) {
+  std::vector<float> packed(static_cast<size_t>(exposureCount) * 2u, 0.0f);
+  for (uint32_t index = 0u; index < exposureCount; ++index) {
+    const size_t offset = static_cast<size_t>(index) * 2u;
+    packed[offset] = logExposure[index];
+    if (index + 1u < exposureCount) {
+      packed[offset + 1u] = 1.0f / std::max(logExposure[index + 1u] - logExposure[index], 1.0e-9f);
+    }
+  }
+  return packed;
+}
+
+std::vector<float> makePackedSpectralDensity(
+  const float *channelDensity,
+  const float *baseDensity,
+  uint32_t wavelengthCount
+) {
+  std::vector<float> packed(static_cast<size_t>(wavelengthCount) * 4u, 0.0f);
+  for (uint32_t wavelength = 0u; wavelength < wavelengthCount; ++wavelength) {
+    const size_t sourceOffset = static_cast<size_t>(wavelength) * 3u;
+    const size_t offset = static_cast<size_t>(wavelength) * 4u;
+    packed[offset] = channelDensity[sourceOffset];
+    packed[offset + 1u] = channelDensity[sourceOffset + 1u];
+    packed[offset + 2u] = channelDensity[sourceOffset + 2u];
+    packed[offset + 3u] = baseDensity[wavelength];
+  }
+  return packed;
+}
+
+std::vector<float> makeScanProducts(
+  const float *filmIlluminant,
+  const float *paperIlluminant,
+  const float *filmBaseDensity,
+  const float *paperBaseDensity,
+  const float *cmfs,
+  uint32_t wavelengthCount
+) {
+  const size_t packedFloatCount = static_cast<size_t>(wavelengthCount) * 8u;
+  const size_t legacyFloatCount = static_cast<size_t>(wavelengthCount) * 8u;
+  std::vector<float> products(packedFloatCount + legacyFloatCount + 4u, 0.0f);
+  const float *illuminants[] = {filmIlluminant, paperIlluminant};
+  const float *baseDensities[] = {filmBaseDensity, paperBaseDensity};
+  for (uint32_t stage = 0u; stage < 2u; ++stage) {
+    float normalization = 0.0f;
+    const size_t packedStageOffset = static_cast<size_t>(stage) * wavelengthCount * 4u;
+    const size_t legacyStageOffset = packedFloatCount + static_cast<size_t>(stage) * wavelengthCount * 4u;
+    for (uint32_t wavelength = 0u; wavelength < wavelengthCount; ++wavelength) {
+      const size_t channelOffset = static_cast<size_t>(wavelength) * 3u;
+      const size_t packedOffset = packedStageOffset + static_cast<size_t>(wavelength) * 4u;
+      const size_t legacyOffset = legacyStageOffset + static_cast<size_t>(wavelength) * 4u;
+      const float illuminant = illuminants[stage][wavelength];
+      const float baseTransmittanceRaw = std::pow(10.0f, -baseDensities[stage][wavelength]);
+      const float baseTransmittance = std::isfinite(baseTransmittanceRaw) ? baseTransmittanceRaw : 0.0f;
+      for (uint32_t channel = 0u; channel < 3u; ++channel) {
+        const float product = illuminant * cmfs[channelOffset + channel];
+        products[packedOffset + channel] = baseTransmittance * product;
+        products[legacyOffset + channel] = product;
+      }
+      normalization += illuminant * cmfs[channelOffset + 1u];
+    }
+    products[packedFloatCount + legacyFloatCount + stage] =
+      1.0f / std::max(normalization, 1.0e-10f);
+  }
+  return products;
+}
+
 std::vector<float> makeHanatosRawResponse(
   const ProfileCurveSet &filmCurves,
   const std::vector<float> &linearSensitivity,
@@ -848,9 +914,19 @@ std::vector<float> makeHanatosRawResponsePair(
 ) {
   std::vector<float> response = makeHanatosRawResponse(filmCurves, linearSensitivity, hanatosSpectra, hanatos, method);
   std::vector<float> compressed = remapHanatosResponseForInputGamutCompression(filmCurves, response, hanatos);
-  response.reserve(response.size() + compressed.size());
-  response.insert(response.end(), compressed.begin(), compressed.end());
-  return response;
+  std::vector<float> packed;
+  packed.reserve((response.size() + compressed.size()) / 3u * 4u);
+  const auto appendPacked = [&](const std::vector<float> &source) {
+    for (size_t offset = 0u; offset + 2u < source.size(); offset += 3u) {
+      packed.push_back(source[offset]);
+      packed.push_back(source[offset + 1u]);
+      packed.push_back(source[offset + 2u]);
+      packed.push_back(0.0f);
+    }
+  };
+  appendPacked(response);
+  appendPacked(compressed);
+  return packed;
 }
 
 uint32_t findMemoryTypeIndex(
@@ -1101,7 +1177,7 @@ struct VulkanDiffusionComponent {
 static_assert(sizeof(VulkanDiffusionInfo) == 16u);
 static_assert(sizeof(VulkanDiffusionComponent) == 16u);
 
-constexpr uint32_t kCoreFrameFloatCount = 91u;
+constexpr uint32_t kCoreFrameFloatCount = 97u;
 constexpr uint32_t kCoreFrameIntCount = 28u;
 constexpr uint32_t kCoreHalationSetCount = 13u;
 constexpr uint32_t kCoreDiffusionSetCount = 3u;
@@ -1156,6 +1232,7 @@ enum : uint32_t {
   kPrintScanOpFull = 0u,
   kPrintScanOpPrintRaw = 1u,
   kPrintScanOpFinalFromPrintRaw = 2u,
+  kPrintScanOpFrameConstants = 3u,
 };
 
 enum : uint32_t {
@@ -2490,6 +2567,7 @@ struct VulkanRenderer::Impl {
     ScratchBuffer grainLayerB;
     ScratchBuffer frameFloats;
     ScratchBuffer frameInts;
+    ScratchBuffer filteredEnlargerResponse;
     VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
     VkDescriptorSet exposureDescriptorSet = VK_NULL_HANDLE;
     VkDescriptorSet developDescriptorSet = VK_NULL_HANDLE;
@@ -3799,7 +3877,9 @@ bool VulkanRenderer::Impl::prepareStaticFilmResources(
     return false;
   }
 
-  const VkDeviceSize logExposureBytes = static_cast<VkDeviceSize>(curves->exposureCount) * sizeof(float);
+  const std::vector<float> packedFilmCurveExposure =
+    makePackedCurveExposure(curves->logExposure, curves->exposureCount);
+  const VkDeviceSize logExposureBytes = static_cast<VkDeviceSize>(packedFilmCurveExposure.size()) * sizeof(float);
   const VkDeviceSize densityCurveBytes = static_cast<VkDeviceSize>(curves->exposureCount) * 3u * sizeof(float);
   const VkDeviceSize densityCurveLayerBytes = static_cast<VkDeviceSize>(curves->exposureCount) * 9u * sizeof(float);
   const VkDeviceSize densityCurveLayerMaximaBytes = 9u * sizeof(float);
@@ -3839,9 +3919,9 @@ bool VulkanRenderer::Impl::prepareStaticFilmResources(
   const HanatosSpectraLutInfo &hanatos = hanatosSpectraLutInfo();
   std::vector<float> hanatosRawResponse = needsHanatos
     ? makeHanatosRawResponsePair(*curves, filmSensitivityLinear, hanatosSpectraData, hanatos, params.rgbToRawMethod)
-    : std::vector<float>{0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    : std::vector<float>(8u, 0.0f);
   if (hanatosRawResponse.empty()) {
-    hanatosRawResponse.assign(6u, 0.0f);
+    hanatosRawResponse.assign(8u, 0.0f);
   }
   const VkDeviceSize hanatosRawResponseBytes =
     static_cast<VkDeviceSize>(hanatosRawResponse.size()) * sizeof(float);
@@ -3852,7 +3932,7 @@ bool VulkanRenderer::Impl::prepareStaticFilmResources(
   const uint64_t privateBytesBefore = diagnostics.privateScratchAllocationBytes;
   const uint64_t privateCountBefore = diagnostics.privateScratchAllocationCount;
 
-  if (!uploadStaticBuffer(staticFilm.logExposure, curves->logExposure, logExposureBytes, "film log exposure") ||
+  if (!uploadStaticBuffer(staticFilm.logExposure, packedFilmCurveExposure.data(), logExposureBytes, "packed film curve exposure") ||
       !uploadStaticBuffer(staticFilm.densityCurves, curves->densityCurves, densityCurveBytes, "film density curves") ||
       !uploadStaticBuffer(staticFilm.inputToReferenceXyz, curves->inputToReferenceXyz, inputMatrixBytes, "input to reference XYZ matrices") ||
       !uploadStaticBuffer(staticFilm.inputToSrgb, curves->inputToSrgb, inputMatrixBytes, "input to sRGB matrices") ||
@@ -3873,7 +3953,10 @@ bool VulkanRenderer::Impl::prepareStaticFilmResources(
     return false;
   }
   if (includePrintScanResources) {
-    const VkDeviceSize paperLogExposureBytes = static_cast<VkDeviceSize>(paperCurves->exposureCount) * sizeof(float);
+    const std::vector<float> packedPaperCurveExposure =
+      makePackedCurveExposure(paperCurves->logExposure, paperCurves->exposureCount);
+    const VkDeviceSize paperLogExposureBytes =
+      static_cast<VkDeviceSize>(packedPaperCurveExposure.size()) * sizeof(float);
     const VkDeviceSize paperDensityCurveBytes = static_cast<VkDeviceSize>(paperCurves->exposureCount) * 3u * sizeof(float);
     const VkDeviceSize wavelengthBytes = static_cast<VkDeviceSize>(curves->wavelengthCount) * sizeof(float);
     const VkDeviceSize spectralTripletBytes = static_cast<VkDeviceSize>(curves->wavelengthCount) * 3u * sizeof(float);
@@ -3885,17 +3968,29 @@ bool VulkanRenderer::Impl::prepareStaticFilmResources(
       sizeof(float);
     const std::vector<float> paperSensitivityLinear =
       makeLinearSensitivity(paperCurves->logSensitivity, paperCurves->wavelengthCount);
-    if (!uploadStaticBuffer(staticFilm.paperLogExposure, paperCurves->logExposure, paperLogExposureBytes, "paper log exposure") ||
+    const std::vector<float> packedFilmSpectralDensity =
+      makePackedSpectralDensity(curves->channelDensity, curves->baseDensity, curves->wavelengthCount);
+    const std::vector<float> packedPaperSpectralDensity =
+      makePackedSpectralDensity(paperCurves->channelDensity, paperCurves->baseDensity, paperCurves->wavelengthCount);
+    const std::vector<float> scanProducts = makeScanProducts(
+      curves->scanIlluminant,
+      paperCurves->scanIlluminant,
+      curves->baseDensity,
+      paperCurves->baseDensity,
+      standardObserverCmfs(),
+      curves->wavelengthCount
+    );
+    if (!uploadStaticBuffer(staticFilm.paperLogExposure, packedPaperCurveExposure.data(), paperLogExposureBytes, "packed paper curve exposure") ||
         !uploadStaticBuffer(staticFilm.paperDensityCurves, paperCurves->densityCurves, paperDensityCurveBytes, "paper density curves") ||
-        !uploadStaticBuffer(staticFilm.filmChannelDensity, curves->channelDensity, spectralTripletBytes, "film channel density") ||
+        !uploadStaticBuffer(staticFilm.filmChannelDensity, packedFilmSpectralDensity.data(), packedFilmSpectralDensity.size() * sizeof(float), "packed film spectral density") ||
         !uploadStaticBuffer(staticFilm.filmBaseDensity, curves->baseDensity, wavelengthBytes, "film base density") ||
         !uploadStaticBuffer(staticFilm.paperLogSensitivity, paperSensitivityLinear.data(), spectralTripletBytes, "paper linear sensitivity") ||
         !uploadStaticBuffer(staticFilm.thKg3Illuminant, thKg3Illuminant(), wavelengthBytes, "TH-KG3 illuminant") ||
         !uploadStaticBuffer(staticFilm.customEnlargerFilters, customEnlargerFilters(), spectralTripletBytes, "custom enlarger filters") ||
         !uploadStaticBuffer(staticFilm.neutralPrintFilters, neutralPrintFilters(), neutralPrintFilterBytes, "neutral print filters") ||
-        !uploadStaticBuffer(staticFilm.paperChannelDensity, paperCurves->channelDensity, spectralTripletBytes, "paper channel density") ||
+        !uploadStaticBuffer(staticFilm.paperChannelDensity, packedPaperSpectralDensity.data(), packedPaperSpectralDensity.size() * sizeof(float), "packed paper spectral density") ||
         !uploadStaticBuffer(staticFilm.paperBaseDensity, paperCurves->baseDensity, wavelengthBytes, "paper base density") ||
-        !uploadStaticBuffer(staticFilm.filmScanIlluminant, curves->scanIlluminant, wavelengthBytes, "film scan illuminant") ||
+        !uploadStaticBuffer(staticFilm.filmScanIlluminant, scanProducts.data(), scanProducts.size() * sizeof(float), "packed scan products") ||
         !uploadStaticBuffer(staticFilm.paperScanIlluminant, paperCurves->scanIlluminant, wavelengthBytes, "paper scan illuminant") ||
         !uploadStaticBuffer(staticFilm.standardObserverCmfs, standardObserverCmfs(), spectralTripletBytes, "standard observer CMFs") ||
         !uploadStaticBuffer(staticFilm.filmScanToOutputRgb, curves->scanToOutputRgb, inputMatrixBytes, "film scan to output RGB") ||
@@ -4184,6 +4279,7 @@ void VulkanRenderer::Impl::destroyCoreFrameResources() {
   destroyScratchBuffer(coreFrame.cameraDiffusionInfo);
   destroyScratchBuffer(coreFrame.frameInts);
   destroyScratchBuffer(coreFrame.frameFloats);
+  destroyScratchBuffer(coreFrame.filteredEnlargerResponse);
   destroyScratchBuffer(coreFrame.printDiffusionRaw);
   destroyScratchBuffer(coreFrame.printRaw);
   destroyScratchBuffer(coreFrame.dirDensity);
@@ -4739,7 +4835,7 @@ bool VulkanRenderer::Impl::renderCoreBootstrap(
     halationExtraPassCount +
     dirExtraPassCount +
     grainExtraPassCount +
-    (printScanPassEnabled ? (printDiffusionPath ? printDiffusionExtraPassCount : 1u) : 0u) +
+    (printScanPassEnabled ? 1u + (printDiffusionPath ? printDiffusionExtraPassCount : 1u) : 0u) +
     scannerPostExtraPassCount;
   diagnostics.privateScratchEnabled = false;
   diagnostics.halationPath = halationPassEnabled;
@@ -4865,6 +4961,14 @@ bool VulkanRenderer::Impl::renderCoreBootstrap(
   if (frameParamsEnabled &&
       (!ensureSharedScratchBuffer(coreFrame.frameFloats, kCoreFrameFloatCount * sizeof(float), "core frame float params") ||
        !ensureSharedScratchBuffer(coreFrame.frameInts, kCoreFrameIntCount * sizeof(uint32_t), "core frame int params"))) {
+    return false;
+  }
+  if (printScanPassEnabled &&
+      !ensurePrivateScratchBuffer(
+        coreFrame.filteredEnlargerResponse,
+        static_cast<VkDeviceSize>(staticFilm.wavelengthCount) * 8u * sizeof(float),
+        "filtered enlarger response"
+      )) {
     return false;
   }
   diagnostics.privateScratchEnabled = preferPrivateScratch;
@@ -5196,6 +5300,10 @@ bool VulkanRenderer::Impl::renderCoreBootstrap(
   paperLogSensitivityBufferInfo.buffer = staticFilm.paperLogSensitivity.buffer;
   paperLogSensitivityBufferInfo.offset = 0;
   paperLogSensitivityBufferInfo.range = staticFilm.paperLogSensitivity.capacity;
+  VkDescriptorBufferInfo filteredEnlargerResponseBufferInfo{};
+  filteredEnlargerResponseBufferInfo.buffer = coreFrame.filteredEnlargerResponse.buffer;
+  filteredEnlargerResponseBufferInfo.offset = 0;
+  filteredEnlargerResponseBufferInfo.range = coreFrame.filteredEnlargerResponse.capacity;
   VkDescriptorBufferInfo thKg3IlluminantBufferInfo{};
   thKg3IlluminantBufferInfo.buffer = staticFilm.thKg3Illuminant.buffer;
   thKg3IlluminantBufferInfo.offset = 0;
@@ -5480,14 +5588,14 @@ bool VulkanRenderer::Impl::renderCoreBootstrap(
     writeStorageBuffer(set, 11, paperDensityCurvesBufferInfo);
     writeStorageBuffer(set, 12, filmChannelDensityBufferInfo);
     writeStorageBuffer(set, 13, filmBaseDensityBufferInfo);
-    writeStorageBuffer(set, 14, paperLogSensitivityBufferInfo);
+    writeStorageBuffer(set, 14, filteredEnlargerResponseBufferInfo);
     writeStorageBuffer(set, 15, thKg3IlluminantBufferInfo);
     writeStorageBuffer(set, 16, customEnlargerFiltersBufferInfo);
     writeStorageBuffer(set, 17, neutralPrintFiltersBufferInfo);
     writeStorageBuffer(set, 18, paperChannelDensityBufferInfo);
     writeStorageBuffer(set, 19, paperBaseDensityBufferInfo);
     writeStorageBuffer(set, 20, filmScanIlluminantBufferInfo);
-    writeStorageBuffer(set, 21, paperScanIlluminantBufferInfo);
+    writeStorageBuffer(set, 21, paperLogSensitivityBufferInfo);
     writeStorageBuffer(set, 22, standardObserverCmfsBufferInfo);
     writeStorageBuffer(set, 23, filmScanToOutputRgbBufferInfo);
     writeStorageBuffer(set, 24, paperScanToOutputRgbBufferInfo);
@@ -6211,6 +6319,17 @@ bool VulkanRenderer::Impl::renderCoreBootstrap(
     insertComputeBarrier();
 
     vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, printScanPipeline);
+    pushConstants._pad0 = kPrintScanOpFrameConstants;
+    pushConstants._pad1 = 0u;
+    pushConstants._pad2 = 0u;
+    const VkDescriptorSet frameConstantsSet = printDiffusionPath
+      ? coreFrame.printDiffusionDescriptorSets[0]
+      : coreFrame.finalDescriptorSet;
+    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, corePipelineLayout, 0, 1, &frameConstantsSet, 0, nullptr);
+    vkCmdPushConstants(commandBuffer, corePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pushConstants), &pushConstants);
+    vkCmdDispatch(commandBuffer, 1u, 1u, 1u);
+    insertComputeBarrier();
+
     if (printDiffusionPath) {
       pushConstants._pad0 = kPrintScanOpPrintRaw;
       pushConstants._pad1 = 0u;

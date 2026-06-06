@@ -34,7 +34,7 @@ layout(std430, binding = 8) readonly buffer InputToReferenceXyzMatrices {
 };
 
 layout(std430, binding = 9) readonly buffer HanatosRawResponse {
-  float hanatosRawResponse[];
+  vec4 hanatosRawResponse[];
 };
 
 layout(push_constant) uniform CoreParams {
@@ -209,7 +209,7 @@ vec3 hanatosRaw(vec3 xyz) {
   vec3 raw = vec3(0.0);
   float weightSum = 0.0;
   const uint responseOffset = colorAdaptationEnabled(kColorAdaptationInputCompression)
-    ? params.hanatosWidth * params.hanatosHeight * 3u
+    ? params.hanatosWidth * params.hanatosHeight
     : 0u;
   for (uint i = 0u; i < 4u; ++i) {
     const uint xi = safeIndex(xBase - 1 + int(i), params.hanatosWidth);
@@ -217,12 +217,8 @@ vec3 hanatosRaw(vec3 xyz) {
       const uint yj = safeIndex(yBase - 1 + int(j), params.hanatosHeight);
       const float weight = wx[i] * wy[j];
       weightSum += weight;
-      const uint lutOffset = responseOffset + (xi * params.hanatosHeight + yj) * 3u;
-      raw += weight * vec3(
-        hanatosRawResponse[lutOffset],
-        hanatosRawResponse[lutOffset + 1u],
-        hanatosRawResponse[lutOffset + 2u]
-      );
+      const uint lutOffset = responseOffset + xi * params.hanatosHeight + yj;
+      raw += weight * hanatosRawResponse[lutOffset].xyz;
     }
   }
   if (weightSum != 0.0) {

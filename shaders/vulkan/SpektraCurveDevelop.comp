@@ -13,7 +13,7 @@ layout(std430, binding = 1) writeonly buffer DestinationPixels {
 };
 
 layout(std430, binding = 2) readonly buffer FilmLogExposure {
-  float logExposure[];
+  vec2 curveExposure[];
 };
 
 layout(std430, binding = 3) readonly buffer FilmDensityCurves {
@@ -67,13 +67,13 @@ float interpDensityCurve(float logRaw, uint channel) {
     return 0.0;
   }
 
-  const float gamma = max(params.filmGamma, 1.0e-6);
-  const float firstX = logExposure[0] / gamma;
-  const float lastX = logExposure[count - 1u] / gamma;
-  if (logRaw <= firstX) {
+  const float lookupRaw = params.filmGamma == 1.0 ? logRaw : logRaw * max(params.filmGamma, 1.0e-6);
+  const float firstX = curveExposure[0].x;
+  const float lastX = curveExposure[count - 1u].x;
+  if (lookupRaw <= firstX) {
     return densityCurves[channel];
   }
-  if (logRaw >= lastX) {
+  if (lookupRaw >= lastX) {
     return densityCurves[(count - 1u) * 3u + channel];
   }
 
@@ -81,34 +81,32 @@ float interpDensityCurve(float logRaw, uint channel) {
   uint hi = count - 1u;
   while (hi - lo > 1u) {
     const uint mid = (lo + hi) >> 1u;
-    const float x = logExposure[mid] / gamma;
-    if (x <= logRaw) {
+    if (curveExposure[mid].x <= lookupRaw) {
       lo = mid;
     } else {
       hi = mid;
     }
   }
 
-  const float x0 = logExposure[lo] / gamma;
-  const float x1 = logExposure[hi] / gamma;
+  const float x0 = curveExposure[lo].x;
+  const float x1 = curveExposure[hi].x;
+  const float inverseDx0 = curveExposure[lo].y;
   const float y0 = densityCurves[lo * 3u + channel];
   const float y1 = densityCurves[hi * 3u + channel];
-  const float t = clamp((logRaw - x0) / max(x1 - x0, 1.0e-9), 0.0, 1.0);
+  const float t = clamp((lookupRaw - x0) * inverseDx0, 0.0, 1.0);
   if (colorAdaptationEnabled(kColorAdaptationCurveSmoothing) && count > 2u) {
     const float dx0 = max(x1 - x0, 1.0e-9);
-    const float d0 = (y1 - y0) / dx0;
+    const float d0 = (y1 - y0) * inverseDx0;
     float m0 = d0;
     float m1 = d0;
     if (lo > 0u) {
-      const float xPrev = logExposure[lo - 1u] / gamma;
       const float yPrev = densityCurves[(lo - 1u) * 3u + channel];
-      const float dPrev = (y0 - yPrev) / max(x0 - xPrev, 1.0e-9);
+      const float dPrev = (y0 - yPrev) * curveExposure[lo - 1u].y;
       m0 = dPrev * d0 > 0.0 ? 0.5 * (dPrev + d0) : 0.0;
     }
     if (hi + 1u < count) {
-      const float xNext = logExposure[hi + 1u] / gamma;
       const float yNext = densityCurves[(hi + 1u) * 3u + channel];
-      const float dNext = (yNext - y1) / max(xNext - x1, 1.0e-9);
+      const float dNext = (yNext - y1) * curveExposure[hi].y;
       m1 = dNext * d0 > 0.0 ? 0.5 * (dNext + d0) : 0.0;
     }
     if (abs(d0) <= 1.0e-9) {

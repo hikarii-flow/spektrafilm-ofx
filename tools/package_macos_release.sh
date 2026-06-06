@@ -41,10 +41,12 @@ require_env() {
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-BUILD_DIR="${PROJECT_ROOT}/build"
+BUILD_DIR="${PROJECT_ROOT}/build-macos-release"
 OUTPUT_DIR="${PROJECT_ROOT}/../../website/public/downloads"
 BUILD_TYPE="${CMAKE_BUILD_TYPE:-Release}"
 MACOS_ARCHITECTURES="${CMAKE_OSX_ARCHITECTURES:-arm64;x86_64}"
+
+[[ "${BUILD_TYPE}" == "Release" ]] || die "public macOS packages must use CMAKE_BUILD_TYPE=Release"
 
 IFS=';' read -r -a EXPECTED_MACOS_ARCHS <<< "${MACOS_ARCHITECTURES}"
 if [[ "${#EXPECTED_MACOS_ARCHS[@]}" -eq 0 ]]; then
@@ -166,10 +168,17 @@ LEGACY_FLOW_ZIP_PATH="${OUTPUT_DIR}/spektrafilm_flow-OFX-macOS.zip"
 log "configuring ${BUILD_TYPE} macOS release build in ${BUILD_DIR} (${MACOS_ARCHITECTURES})"
 cmake -S "${PROJECT_ROOT}" -B "${BUILD_DIR}" \
   -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
-  -DCMAKE_OSX_ARCHITECTURES="${MACOS_ARCHITECTURES}"
+  -DCMAKE_OSX_ARCHITECTURES="${MACOS_ARCHITECTURES}" \
+  -DSPEKTRAFILM_RELEASE_LTO=ON \
+  -DSPEKTRAFILM_METAL_OPTIMIZATION_LEVEL=-O3 \
+  -DSPEKTRAFILM_METAL_PROFILE_SOURCES=OFF \
+  -DSPEKTRAFILM_NATIVE_FAST_MATH=OFF \
+  -DSPEKTRAFILM_METAL_FAST_MATH=OFF \
+  -DSPEKTRAFILM_OFX_METAL_GPU_BUFFERS=ON
 
 log "building public OFX bundles"
 cmake --build "${BUILD_DIR}" \
+  --config "${BUILD_TYPE}" \
   --target spektrafilmBundleResources spektrafilm_flowBundleResources \
   --parallel
 

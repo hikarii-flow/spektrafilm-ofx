@@ -11,6 +11,13 @@ const int kLinearSrgbColorSpace = 17;
 const uint kPrintScanOpFull = 0u;
 const uint kPrintScanOpPrintRaw = 1u;
 const uint kPrintScanOpFinalFromPrintRaw = 2u;
+const uint kPrintScanOpFrameConstants = 3u;
+const uint kFramePrintExposureScaleR = 91u;
+const uint kFramePrintExposureScaleG = 92u;
+const uint kFramePrintExposureScaleB = 93u;
+const uint kFramePrintPreflashR = 94u;
+const uint kFramePrintPreflashG = 95u;
+const uint kFramePrintPreflashB = 96u;
 const uint kFrameHdrReferenceWhiteNits = 72u;
 const uint kFrameHdrPeakNits = 73u;
 const uint kFrameHdrExposureEv = 74u;
@@ -38,7 +45,7 @@ layout(std430, binding = 1) writeonly buffer DestinationPixels {
 };
 
 layout(std430, binding = 2) readonly buffer FilmLogExposure {
-  float filmLogExposure[];
+  vec2 filmCurveExposure[];
 };
 
 layout(std430, binding = 3) readonly buffer FilmDensityCurves {
@@ -58,11 +65,11 @@ layout(std430, binding = 8) readonly buffer InputToReferenceXyzMatrices {
 };
 
 layout(std430, binding = 9) readonly buffer HanatosRawResponse {
-  float hanatosRawResponse[];
+  vec4 hanatosRawResponse[];
 };
 
 layout(std430, binding = 10) readonly buffer PaperLogExposure {
-  float paperLogExposure[];
+  vec2 paperCurveExposure[];
 };
 
 layout(std430, binding = 11) readonly buffer PaperDensityCurves {
@@ -70,15 +77,15 @@ layout(std430, binding = 11) readonly buffer PaperDensityCurves {
 };
 
 layout(std430, binding = 12) readonly buffer FilmChannelDensity {
-  float filmChannelDensity[];
+  vec4 filmSpectralDensity[];
 };
 
 layout(std430, binding = 13) readonly buffer FilmBaseDensity {
   float filmBaseDensity[];
 };
 
-layout(std430, binding = 14) readonly buffer PaperLogSensitivity {
-  float paperLogSensitivity[];
+layout(std430, binding = 14) buffer FilteredEnlargerResponse {
+  vec4 filteredEnlargerResponse[];
 };
 
 layout(std430, binding = 15) readonly buffer ThKg3Illuminant {
@@ -94,19 +101,19 @@ layout(std430, binding = 17) readonly buffer NeutralPrintFilters {
 };
 
 layout(std430, binding = 18) readonly buffer PaperChannelDensity {
-  float paperChannelDensity[];
+  vec4 paperSpectralDensity[];
 };
 
 layout(std430, binding = 19) readonly buffer PaperBaseDensity {
   float paperBaseDensity[];
 };
 
-layout(std430, binding = 20) readonly buffer FilmScanIlluminant {
-  float filmScanIlluminant[];
+layout(std430, binding = 20) readonly buffer ScanProducts {
+  vec4 scanProducts[];
 };
 
-layout(std430, binding = 21) readonly buffer PaperScanIlluminant {
-  float paperScanIlluminant[];
+layout(std430, binding = 21) readonly buffer PaperLogSensitivity {
+  float paperLogSensitivity[];
 };
 
 layout(std430, binding = 22) readonly buffer StandardObserverCmfs {
@@ -129,7 +136,7 @@ layout(std430, binding = 26) readonly buffer AcademyPrinterDensityData {
   float academyPrinterDensityData[];
 };
 
-layout(std430, binding = 27) readonly buffer FrameFloats {
+layout(std430, binding = 27) buffer FrameFloats {
   float frameFloats[];
 };
 
@@ -577,13 +584,13 @@ float interpFilmDensityCurve(float logRaw, uint channel, float gammaFactor) {
   if (count == 0u) {
     return 0.0;
   }
-  const float gamma = max(gammaFactor, 1.0e-6);
-  const float firstX = filmLogExposure[0] / gamma;
-  const float lastX = filmLogExposure[count - 1u] / gamma;
-  if (logRaw <= firstX) {
+  const float lookupRaw = gammaFactor == 1.0 ? logRaw : logRaw * max(gammaFactor, 1.0e-6);
+  const float firstX = filmCurveExposure[0].x;
+  const float lastX = filmCurveExposure[count - 1u].x;
+  if (lookupRaw <= firstX) {
     return filmDensityCurves[channel];
   }
-  if (logRaw >= lastX) {
+  if (lookupRaw >= lastX) {
     return filmDensityCurves[(count - 1u) * 3u + channel];
   }
 
@@ -591,34 +598,32 @@ float interpFilmDensityCurve(float logRaw, uint channel, float gammaFactor) {
   uint hi = count - 1u;
   while (hi - lo > 1u) {
     const uint mid = (lo + hi) >> 1u;
-    const float x = filmLogExposure[mid] / gamma;
-    if (x <= logRaw) {
+    if (filmCurveExposure[mid].x <= lookupRaw) {
       lo = mid;
     } else {
       hi = mid;
     }
   }
 
-  const float x0 = filmLogExposure[lo] / gamma;
-  const float x1 = filmLogExposure[hi] / gamma;
+  const float x0 = filmCurveExposure[lo].x;
+  const float x1 = filmCurveExposure[hi].x;
+  const float inverseDx0 = filmCurveExposure[lo].y;
   const float y0 = filmDensityCurves[lo * 3u + channel];
   const float y1 = filmDensityCurves[hi * 3u + channel];
-  const float t = clamp((logRaw - x0) / max(x1 - x0, 1.0e-9), 0.0, 1.0);
+  const float t = clamp((lookupRaw - x0) * inverseDx0, 0.0, 1.0);
   if (colorAdaptationEnabled(kColorAdaptationCurveSmoothing) && count > 2u) {
     const float dx0 = max(x1 - x0, 1.0e-9);
-    const float d0 = (y1 - y0) / dx0;
+    const float d0 = (y1 - y0) * inverseDx0;
     float m0 = d0;
     float m1 = d0;
     if (lo > 0u) {
-      const float xPrev = filmLogExposure[lo - 1u] / gamma;
       const float yPrev = filmDensityCurves[(lo - 1u) * 3u + channel];
-      const float dPrev = (y0 - yPrev) / max(x0 - xPrev, 1.0e-9);
+      const float dPrev = (y0 - yPrev) * filmCurveExposure[lo - 1u].y;
       m0 = dPrev * d0 > 0.0 ? 0.5 * (dPrev + d0) : 0.0;
     }
     if (hi + 1u < count) {
-      const float xNext = filmLogExposure[hi + 1u] / gamma;
       const float yNext = filmDensityCurves[(hi + 1u) * 3u + channel];
-      const float dNext = (yNext - y1) / max(xNext - x1, 1.0e-9);
+      const float dNext = (yNext - y1) * filmCurveExposure[hi].y;
       m1 = dNext * d0 > 0.0 ? 0.5 * (dNext + d0) : 0.0;
     }
     if (abs(d0) <= 1.0e-9) {
@@ -644,13 +649,13 @@ float interpPaperDensityCurve(float logRaw, uint channel, float gammaFactor) {
   if (count == 0u) {
     return 0.0;
   }
-  const float gamma = max(gammaFactor, 1.0e-6);
-  const float firstX = paperLogExposure[0] / gamma;
-  const float lastX = paperLogExposure[count - 1u] / gamma;
-  if (logRaw <= firstX) {
+  const float lookupRaw = gammaFactor == 1.0 ? logRaw : logRaw * max(gammaFactor, 1.0e-6);
+  const float firstX = paperCurveExposure[0].x;
+  const float lastX = paperCurveExposure[count - 1u].x;
+  if (lookupRaw <= firstX) {
     return paperDensityCurves[channel];
   }
-  if (logRaw >= lastX) {
+  if (lookupRaw >= lastX) {
     return paperDensityCurves[(count - 1u) * 3u + channel];
   }
 
@@ -658,34 +663,32 @@ float interpPaperDensityCurve(float logRaw, uint channel, float gammaFactor) {
   uint hi = count - 1u;
   while (hi - lo > 1u) {
     const uint mid = (lo + hi) >> 1u;
-    const float x = paperLogExposure[mid] / gamma;
-    if (x <= logRaw) {
+    if (paperCurveExposure[mid].x <= lookupRaw) {
       lo = mid;
     } else {
       hi = mid;
     }
   }
 
-  const float x0 = paperLogExposure[lo] / gamma;
-  const float x1 = paperLogExposure[hi] / gamma;
+  const float x0 = paperCurveExposure[lo].x;
+  const float x1 = paperCurveExposure[hi].x;
+  const float inverseDx0 = paperCurveExposure[lo].y;
   const float y0 = paperDensityCurves[lo * 3u + channel];
   const float y1 = paperDensityCurves[hi * 3u + channel];
-  const float t = clamp((logRaw - x0) / max(x1 - x0, 1.0e-9), 0.0, 1.0);
+  const float t = clamp((lookupRaw - x0) * inverseDx0, 0.0, 1.0);
   if (colorAdaptationEnabled(kColorAdaptationCurveSmoothing) && count > 2u) {
     const float dx0 = max(x1 - x0, 1.0e-9);
-    const float d0 = (y1 - y0) / dx0;
+    const float d0 = (y1 - y0) * inverseDx0;
     float m0 = d0;
     float m1 = d0;
     if (lo > 0u) {
-      const float xPrev = paperLogExposure[lo - 1u] / gamma;
       const float yPrev = paperDensityCurves[(lo - 1u) * 3u + channel];
-      const float dPrev = (y0 - yPrev) / max(x0 - xPrev, 1.0e-9);
+      const float dPrev = (y0 - yPrev) * paperCurveExposure[lo - 1u].y;
       m0 = dPrev * d0 > 0.0 ? 0.5 * (dPrev + d0) : 0.0;
     }
     if (hi + 1u < count) {
-      const float xNext = paperLogExposure[hi + 1u] / gamma;
       const float yNext = paperDensityCurves[(hi + 1u) * 3u + channel];
-      const float dNext = (yNext - y1) / max(xNext - x1, 1.0e-9);
+      const float dNext = (yNext - y1) * paperCurveExposure[hi].y;
       m1 = dNext * d0 > 0.0 ? 0.5 * (dNext + d0) : 0.0;
     }
     if (abs(d0) <= 1.0e-9) {
@@ -758,7 +761,7 @@ vec3 hanatosRaw(vec3 xyz) {
   vec3 raw = vec3(0.0);
   float weightSum = 0.0;
   const uint responseOffset = colorAdaptationEnabled(kColorAdaptationInputCompression)
-    ? params.hanatosWidth * params.hanatosHeight * 3u
+    ? params.hanatosWidth * params.hanatosHeight
     : 0u;
   for (uint i = 0u; i < 4u; ++i) {
     const uint xi = safeIndex(xBase - 1 + int(i), params.hanatosWidth);
@@ -766,8 +769,8 @@ vec3 hanatosRaw(vec3 xyz) {
       const uint yj = safeIndex(yBase - 1 + int(j), params.hanatosHeight);
       const float weight = wx[i] * wy[j];
       weightSum += weight;
-      const uint offset = responseOffset + (xi * params.hanatosHeight + yj) * 3u;
-      raw += weight * vec3(hanatosRawResponse[offset], hanatosRawResponse[offset + 1u], hanatosRawResponse[offset + 2u]);
+      const uint offset = responseOffset + xi * params.hanatosHeight + yj;
+      raw += weight * hanatosRawResponse[offset].xyz;
     }
   }
   if (weightSum != 0.0) {
@@ -985,6 +988,20 @@ vec3 apdNeutralExposureScale() {
 }
 
 vec3 printRawFromFilmDensity(vec3 filmDensityCmy) {
+  if (u(3u) != 1u && f(7u) == 0.0 && u(8u) == 81u) {
+    vec3 raw0 = vec3(0.0);
+    vec3 raw1 = vec3(0.0);
+    vec3 raw2 = vec3(0.0);
+    for (uint wavelength = 0u; wavelength < 81u; wavelength += 3u) {
+      raw0 += finiteOrZero(pow(10.0, -dot(filmDensityCmy, filmSpectralDensity[wavelength].xyz))) *
+        filteredEnlargerResponse[wavelength].xyz;
+      raw1 += finiteOrZero(pow(10.0, -dot(filmDensityCmy, filmSpectralDensity[wavelength + 1u].xyz))) *
+        filteredEnlargerResponse[wavelength + 1u].xyz;
+      raw2 += finiteOrZero(pow(10.0, -dot(filmDensityCmy, filmSpectralDensity[wavelength + 2u].xyz))) *
+        filteredEnlargerResponse[wavelength + 2u].xyz;
+    }
+    return raw0 + raw1 + raw2;
+  }
   vec3 raw = vec3(0.0);
   const vec3 bypassedFilmDensityCmy = negativeBleachBypassDyeDensity(filmDensityCmy, f(7u));
   const float retainedSilverDensity = bleachBypassRetainedSilverDensity(filmDensityCmy, f(7u), false);
@@ -992,11 +1009,9 @@ vec3 printRawFromFilmDensity(vec3 filmDensityCmy) {
     vec3 normalization = vec3(0.0);
     for (uint wavelength = 0u; wavelength < u(8u); ++wavelength) {
       const uint offset = wavelength * 3u;
+      const vec4 spectral = filmSpectralDensity[wavelength];
       const float densitySpectral =
-        bypassedFilmDensityCmy.r * filmChannelDensity[offset] +
-        bypassedFilmDensityCmy.g * filmChannelDensity[offset + 1u] +
-        bypassedFilmDensityCmy.b * filmChannelDensity[offset + 2u] +
-        filmBaseDensity[wavelength] +
+        dot(bypassedFilmDensityCmy, spectral.xyz) + spectral.w +
         retainedSilverDensity;
       const float transmittance = finiteOrZero(pow(10.0, -densitySpectral));
       const vec3 apd = max(vec3(academyPrinterDensityData[offset], academyPrinterDensityData[offset + 1u], academyPrinterDensityData[offset + 2u]), vec3(0.0));
@@ -1006,12 +1021,9 @@ vec3 printRawFromFilmDensity(vec3 filmDensityCmy) {
     return raw / max(normalization, vec3(1.0e-10));
   }
   for (uint wavelength = 0u; wavelength < u(8u); ++wavelength) {
-    const uint offset = wavelength * 3u;
+    const vec4 spectral = filmSpectralDensity[wavelength];
     const float densitySpectral =
-      bypassedFilmDensityCmy.r * filmChannelDensity[offset] +
-      bypassedFilmDensityCmy.g * filmChannelDensity[offset + 1u] +
-      bypassedFilmDensityCmy.b * filmChannelDensity[offset + 2u] +
-      filmBaseDensity[wavelength] +
+      dot(bypassedFilmDensityCmy, spectral.xyz) + spectral.w +
       retainedSilverDensity;
     const float light = finiteOrZero(pow(10.0, -densitySpectral) * filteredEnlargerIlluminant(wavelength));
     raw += light * paperSensitivity(wavelength);
@@ -1035,9 +1047,9 @@ vec3 printRawPreflash() {
     }
     return (raw / max(normalization, vec3(1.0e-10))) * apdNeutralExposureScale() * max(f(10u), 0.0);
   }
-  for (uint wavelength = 0u; wavelength < u(8u); ++wavelength) {
-    const float light = finiteOrZero(pow(10.0, -filmBaseDensity[wavelength]) * preflashFilteredEnlargerIlluminant(wavelength));
-    raw += light * paperSensitivity(wavelength);
+  const uint wavelengthCount = u(8u);
+  for (uint wavelength = 0u; wavelength < wavelengthCount; ++wavelength) {
+    raw += filteredEnlargerResponse[wavelengthCount + wavelength].xyz;
   }
   return raw * max(f(10u), 0.0);
 }
@@ -1050,10 +1062,36 @@ float printMidgrayExposureFactor() {
   return 1.0 / max(rawMidgrayGeomean, 1.0e-10);
 }
 
+void buildFrameConstants() {
+  const uint wavelengthCount = u(8u);
+  for (uint wavelength = 0u; wavelength < wavelengthCount; ++wavelength) {
+    const float baseTransmittance = finiteOrZero(pow(10.0, -filmBaseDensity[wavelength]));
+    filteredEnlargerResponse[wavelength] = vec4(
+      baseTransmittance * filteredEnlargerIlluminant(wavelength) * paperSensitivity(wavelength),
+      0.0
+    );
+    filteredEnlargerResponse[wavelengthCount + wavelength] = vec4(
+      baseTransmittance * preflashFilteredEnlargerIlluminant(wavelength) * paperSensitivity(wavelength),
+      0.0
+    );
+  }
+  memoryBarrierBuffer();
+  const float exposure = exp2(f(3u));
+  const vec3 exposureScale = printerLightExposureScale() * printMidgrayExposureFactor() * exposure;
+  const vec3 preflash = printRawPreflash() * exposure;
+  frameFloats[kFramePrintExposureScaleR] = exposureScale.r;
+  frameFloats[kFramePrintExposureScaleG] = exposureScale.g;
+  frameFloats[kFramePrintExposureScaleB] = exposureScale.b;
+  frameFloats[kFramePrintPreflashR] = preflash.r;
+  frameFloats[kFramePrintPreflashG] = preflash.g;
+  frameFloats[kFramePrintPreflashB] = preflash.b;
+}
+
 vec3 timedPrintRaw(vec3 filmDensityCmy) {
   const vec3 raw = printRawFromFilmDensity(filmDensityCmy);
-  const vec3 rawTimed = raw * printerLightExposureScale() * printMidgrayExposureFactor() + printRawPreflash();
-  return max(rawTimed * exp2(f(3u)), vec3(0.0));
+  const vec3 exposureScale = vec3(f(kFramePrintExposureScaleR), f(kFramePrintExposureScaleG), f(kFramePrintExposureScaleB));
+  const vec3 preflash = vec3(f(kFramePrintPreflashR), f(kFramePrintPreflashG), f(kFramePrintPreflashB));
+  return max(raw * exposureScale + preflash, vec3(0.0));
 }
 
 vec3 printLogRaw(vec3 filmDensityCmy) {
@@ -1089,27 +1127,34 @@ vec4 scanDensityToOutputRgbLinearY(
   float retainedSilverDensity,
   bool printStage
 ) {
+  const uint wavelengthCount = u(8u);
+  const uint stageOffset = printStage ? wavelengthCount : 0u;
   vec3 xyz = vec3(0.0);
-  float normalization = 0.0;
-  for (uint wavelength = 0u; wavelength < u(8u); ++wavelength) {
-    const uint offset = wavelength * 3u;
-    const vec3 channelDensity = printStage ?
-      vec3(paperChannelDensity[offset], paperChannelDensity[offset + 1u], paperChannelDensity[offset + 2u]) :
-      vec3(filmChannelDensity[offset], filmChannelDensity[offset + 1u], filmChannelDensity[offset + 2u]);
-    const float baseDensity = printStage ? paperBaseDensity[wavelength] : filmBaseDensity[wavelength];
-    const float scanIlluminant = printStage ? paperScanIlluminant[wavelength] : filmScanIlluminant[wavelength];
-    const float densitySpectral =
-      densityCmy.r * channelDensity.r +
-      densityCmy.g * channelDensity.g +
-      densityCmy.b * channelDensity.b +
-      baseDensity +
-      retainedSilverDensity;
-    const float light = finiteOrZero(pow(10.0, -densitySpectral) * scanIlluminant);
-    const vec3 cmf = vec3(standardObserverCmfs[offset], standardObserverCmfs[offset + 1u], standardObserverCmfs[offset + 2u]);
-    xyz += light * cmf;
-    normalization += scanIlluminant * cmf.y;
+  if (wavelengthCount == 81u && retainedSilverDensity == 0.0 && (printStage ? f(9u) : f(7u)) == 0.0) {
+    vec3 xyz0 = vec3(0.0);
+    vec3 xyz1 = vec3(0.0);
+    vec3 xyz2 = vec3(0.0);
+    for (uint wavelength = 0u; wavelength < 81u; wavelength += 3u) {
+      const vec4 spectral0 = printStage ? paperSpectralDensity[wavelength] : filmSpectralDensity[wavelength];
+      const vec4 spectral1 = printStage ? paperSpectralDensity[wavelength + 1u] : filmSpectralDensity[wavelength + 1u];
+      const vec4 spectral2 = printStage ? paperSpectralDensity[wavelength + 2u] : filmSpectralDensity[wavelength + 2u];
+      xyz0 += finiteOrZero(pow(10.0, -dot(densityCmy, spectral0.xyz))) * scanProducts[stageOffset + wavelength].xyz;
+      xyz1 += finiteOrZero(pow(10.0, -dot(densityCmy, spectral1.xyz))) * scanProducts[stageOffset + wavelength + 1u].xyz;
+      xyz2 += finiteOrZero(pow(10.0, -dot(densityCmy, spectral2.xyz))) * scanProducts[stageOffset + wavelength + 2u].xyz;
+    }
+    xyz = xyz0 + xyz1 + xyz2;
+  } else {
+    const uint legacyStageOffset = wavelengthCount * 2u + stageOffset;
+    for (uint wavelength = 0u; wavelength < wavelengthCount; ++wavelength) {
+      const vec4 spectral = printStage ? paperSpectralDensity[wavelength] : filmSpectralDensity[wavelength];
+      const float transmittance = finiteOrZero(pow(10.0, -(dot(densityCmy, spectral.xyz) + spectral.w + retainedSilverDensity)));
+      xyz += transmittance * scanProducts[legacyStageOffset + wavelength].xyz;
+    }
   }
-  xyz /= max(normalization, 1.0e-10);
+  const float inverseNormalization = printStage
+    ? scanProducts[wavelengthCount * 4u].y
+    : scanProducts[wavelengthCount * 4u].x;
+  xyz *= inverseNormalization;
   const int outputColorSpace = int(finalOutputColorSpace());
   const vec3 rgb = printStage
     ? multiplyPaperScanToOutputRgb(xyz, outputColorSpace)
@@ -1142,6 +1187,12 @@ vec3 applyFilmScanOutputContract(vec4 scan) {
 
 void main() {
   const uvec2 activeGid = gl_GlobalInvocationID.xy;
+  if (params._pad0 == kPrintScanOpFrameConstants) {
+    if (activeGid.x == 0u && activeGid.y == 0u) {
+      buildFrameConstants();
+    }
+    return;
+  }
   const uint activeWidth = params.activeWidth == 0u ? params.width : params.activeWidth;
   const uint activeHeight = params.activeHeight == 0u ? params.height : params.activeHeight;
   if (activeGid.x >= activeWidth || activeGid.y >= activeHeight) {

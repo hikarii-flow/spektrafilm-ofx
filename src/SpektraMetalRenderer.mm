@@ -1445,6 +1445,18 @@ std::vector<float> makePackedSpectralDensity(
   return packed;
 }
 
+std::vector<float> makePackedCurveExposure(const float *logExposure, uint32_t exposureCount) {
+  std::vector<float> packed(static_cast<size_t>(exposureCount) * 2u, 0.0f);
+  for (uint32_t index = 0u; index < exposureCount; ++index) {
+    const size_t packedOffset = static_cast<size_t>(index) * 2u;
+    packed[packedOffset] = logExposure[index];
+    if (index + 1u < exposureCount) {
+      packed[packedOffset + 1u] = 1.0f / std::max(logExposure[index + 1u] - logExposure[index], 1.0e-9f);
+    }
+  }
+  return packed;
+}
+
 std::vector<float> makeScanProducts(
   const float *filmIlluminant,
   const float *paperIlluminant,
@@ -1837,9 +1849,19 @@ std::vector<float> makeHanatosRawResponsePair(
 ) {
   std::vector<float> response = makeHanatosRawResponse(filmCurves, linearSensitivity, hanatosSpectra, hanatos, method);
   std::vector<float> compressed = remapHanatosResponseForInputGamutCompression(filmCurves, response, hanatos);
-  response.reserve(response.size() + compressed.size());
-  response.insert(response.end(), compressed.begin(), compressed.end());
-  return response;
+  std::vector<float> packed;
+  packed.reserve((response.size() + compressed.size()) / 3u * 4u);
+  const auto appendPackedResponse = [&](const std::vector<float> &source) {
+    for (size_t offset = 0u; offset + 2u < source.size(); offset += 3u) {
+      packed.push_back(source[offset]);
+      packed.push_back(source[offset + 1u]);
+      packed.push_back(source[offset + 2u]);
+      packed.push_back(0.0f);
+    }
+  };
+  appendPackedResponse(response);
+  appendPackedResponse(compressed);
+  return packed;
 }
 
 float interpLinear(const std::vector<float> &x, const float *y, uint32_t channel, float target) {
@@ -2989,11 +3011,11 @@ struct MetalRenderer::Impl {
     next.spectralInfo.paperDensityCurveMaximum1 = paperDensityCurveMaximum[1];
     next.spectralInfo.paperDensityCurveMaximum2 = paperDensityCurveMaximum[2];
 
-    const NSUInteger logExposureBytes = static_cast<NSUInteger>(filmCurves->exposureCount) * sizeof(float);
+    const NSUInteger logExposureBytes = static_cast<NSUInteger>(filmCurves->exposureCount) * 2u * sizeof(float);
     const NSUInteger densityCurveBytes = static_cast<NSUInteger>(filmCurves->exposureCount) * 3u * sizeof(float);
     const NSUInteger densityLayerBytes = static_cast<NSUInteger>(filmCurves->exposureCount) * 9u * sizeof(float);
     const NSUInteger densityLayerMaxBytes = 9u * sizeof(float);
-    const NSUInteger paperLogExposureBytes = static_cast<NSUInteger>(paperCurves->exposureCount) * sizeof(float);
+    const NSUInteger paperLogExposureBytes = static_cast<NSUInteger>(paperCurves->exposureCount) * 2u * sizeof(float);
     const NSUInteger paperDensityCurveBytes = static_cast<NSUInteger>(paperCurves->exposureCount) * 3u * sizeof(float);
     const NSUInteger wavelengthBytes = static_cast<NSUInteger>(filmCurves->wavelengthCount) * sizeof(float);
     const NSUInteger sensitivityBytes = static_cast<NSUInteger>(filmCurves->wavelengthCount) * 3u * sizeof(float);
@@ -3027,6 +3049,8 @@ struct MetalRenderer::Impl {
     const std::vector<float> baseFilmSensitivityLinear = makeLinearSensitivity(filmCurves->logSensitivity, filmCurves->wavelengthCount);
     const std::vector<float> filmSensitivityLinear = applyCameraBandPass(*filmCurves, baseFilmSensitivityLinear, params);
     const std::vector<float> paperSensitivityLinear = makeLinearSensitivity(paperCurves->logSensitivity, paperCurves->wavelengthCount);
+    const std::vector<float> filmCurveExposure = makePackedCurveExposure(filmCurves->logExposure, filmCurves->exposureCount);
+    const std::vector<float> paperCurveExposure = makePackedCurveExposure(paperCurves->logExposure, paperCurves->exposureCount);
     const std::vector<float> filmSpectralDensity = makePackedSpectralDensity(
       filmCurves->channelDensity,
       filmCurves->baseDensity,
@@ -3087,7 +3111,7 @@ struct MetalRenderer::Impl {
     }
 
     next.curveInfoBuffer = newStaticBuffer(&next.curveInfo, sizeof(next.curveInfo), "film curve info");
-    next.logExposureBuffer = newStaticBuffer(filmCurves->logExposure, logExposureBytes, "film log exposure");
+    next.logExposureBuffer = newStaticBuffer(filmCurveExposure.data(), logExposureBytes, "film curve exposure");
     next.densityCurvesBuffer = newStaticBuffer(filmCurves->densityCurves, densityCurveBytes, "film density curves");
     next.spectralInfoBuffer = newStaticBuffer(&next.spectralInfo, sizeof(next.spectralInfo), "spectral info");
     next.wavelengthsBuffer = newStaticBuffer(filmCurves->wavelengths, wavelengthBytes, "film wavelengths");
@@ -3101,7 +3125,7 @@ struct MetalRenderer::Impl {
     next.colorDecodeLutBuffer = newStaticBuffer(colorDecodeLuts(), transferLutBytes, "color decode LUT");
     next.colorTransferKindBuffer = newStaticBuffer(colorTransferKinds(), transferKindBytes, "color transfer kind");
     next.paperCurveInfoBuffer = newStaticBuffer(&next.paperCurveInfo, sizeof(next.paperCurveInfo), "paper curve info");
-    next.paperLogExposureBuffer = newStaticBuffer(paperCurves->logExposure, paperLogExposureBytes, "paper log exposure");
+    next.paperLogExposureBuffer = newStaticBuffer(paperCurveExposure.data(), paperLogExposureBytes, "paper curve exposure");
     next.paperDensityCurvesBuffer = newStaticBuffer(paperCurves->densityCurves, paperDensityCurveBytes, "paper density curves");
     next.filmChannelDensityBuffer = newStaticBuffer(filmCurves->channelDensity, sensitivityBytes, "film channel density");
     next.filmBaseDensityBuffer = newStaticBuffer(filmCurves->baseDensity, baseDensityBytes, "film base density");

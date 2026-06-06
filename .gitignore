@@ -1,5 +1,7 @@
 # CMake output and build directories
 build/
+build-release/
+build-*/
 .cache/
 CMakeCache.txt
 CMakeFiles/
@@ -68,6 +70,7 @@ profile-runs/
 PRIVATE_README.md
 PHOTOCHEMICAL_IDEAS.md
 WINDOWS_PORT.md
+standard_core_optimizations.md
 
 # Licensed SMPTE standards CSVs are local-only build inputs.
 Resources/data/standards/
