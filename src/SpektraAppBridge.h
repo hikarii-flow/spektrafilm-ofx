@@ -74,6 +74,10 @@ typedef struct SpektraAppRenderParams {
   float hdrExposureEv;
   int32_t hdrToneMapping;
   int32_t colorAdaptation;
+  int32_t colorAdaptationInputCompression;
+  int32_t colorAdaptationCurveSmoothing;
+  int32_t colorAdaptationOutputLightnessCompression;
+  int32_t colorAdaptationOutputChromaCompression;
   int32_t film;
   int32_t paper;
   int32_t printTiming;

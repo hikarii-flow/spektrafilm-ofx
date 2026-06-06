@@ -273,7 +273,7 @@ spektrafilm::RenderParams parityDefaults() {
   params.rgbToRawMethod = spektrafilm::RgbToRawMethod::Hanatos2025;
   params.inputColorSpace = spektrafilm::ColorSpace::LinearRec2020;
   params.outputColorSpace = spektrafilm::ColorSpace::LinearRec2020;
-  params.outputRole = spektrafilm::OutputRole::SceneHandoff;
+  params.outputRole = spektrafilm::OutputRole::DisplaySdr;
   params.film = spektrafilm::kSpektraDefaultFilmIndex;
   params.paper = spektrafilm::kSpektraDefaultPaperIndex;
   params.printTiming = spektrafilm::PrintTimingMode::FilteredEnlarger;
@@ -630,6 +630,7 @@ bool writeFloatRgba(const std::string &path, const std::vector<float> &pixels) {
 
 int main(int argc, const char **argv) {
   @autoreleasepool {
+    setenv("SPEKTRAFILM_LINEAR_FINAL_OUTPUT", "1", 1);
     Options options;
     if (!parseArgs(argc, argv, options)) {
       printUsage(argv[0]);

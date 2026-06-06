@@ -139,6 +139,14 @@ layout(push_constant) uniform CoreParams {
   uint _pad2;
   int filmPushPullMode;
   float filmPushPullStops;
+  uint fullWidth;
+  uint fullHeight;
+  uint tileOriginX;
+  uint tileOriginY;
+  uint activeOriginX;
+  uint activeOriginY;
+  uint activeWidth;
+  uint activeHeight;
 } params;
 
 vec4 loadSourcePixel(uint index) { return sourcePixels[index]; }
@@ -183,10 +191,18 @@ uint filmCellSeed(vec2 filmUm, float cellSizeUm, uint seed) {
   return spektraHash(seed ^ (uint(cell.x) * 0x1f123bb5u) ^ (uint(cell.y) * 0x5f356495u));
 }
 
+uvec2 absolutePixel(uvec2 gid) {
+  return gid + uvec2(params.tileOriginX, params.tileOriginY);
+}
+
+vec2 fullFrameDims() {
+  return vec2(max(params.fullWidth, max(params.width, 1u)), max(params.fullHeight, max(params.height, 1u)));
+}
+
 vec2 outputPixelFilmUm(uvec2 gid) {
   const float scale = max(f(kFrameEnlargerScale), 1.0);
-  const vec2 safeDims = vec2(max(params.width, 1u), max(params.height, 1u));
-  const vec2 outputUv = (vec2(gid) + vec2(0.5)) / safeDims;
+  const vec2 safeDims = fullFrameDims();
+  const vec2 outputUv = (vec2(absolutePixel(gid)) + vec2(0.5)) / safeDims;
   const vec2 sourceUv = vec2(0.5) +
     (outputUv - vec2(0.5)) / scale +
     vec2(f(kFrameEnlargerOffsetXPercent), f(kFrameEnlargerOffsetYPercent)) * (0.01 / scale);
@@ -196,13 +212,13 @@ vec2 outputPixelFilmUm(uvec2 gid) {
 
 ivec2 filmUmToOutputPixel(vec2 filmUm) {
   const float scale = max(f(kFrameEnlargerScale), 1.0);
-  const vec2 safeDims = vec2(max(params.width, 1u), max(params.height, 1u));
+  const vec2 safeDims = fullFrameDims();
   const float framePixelSizeUm = max(f(kFrameFilmPixelSizeUm) * scale, 1.0e-6);
   const vec2 sourceUv = filmUm / (safeDims * framePixelSizeUm);
   const vec2 outputUv = vec2(0.5) +
     (sourceUv - vec2(0.5)) * scale -
     vec2(f(kFrameEnlargerOffsetXPercent), f(kFrameEnlargerOffsetYPercent)) * 0.01;
-  return ivec2(floor(outputUv * safeDims));
+  return ivec2(floor(outputUv * safeDims)) - ivec2(params.tileOriginX, params.tileOriginY);
 }
 
 uint clampX(int x) {
@@ -1021,7 +1037,13 @@ vec4 densityBlurY(uvec2 gid) {
 }
 
 void main() {
-  const uvec3 gid3 = gl_GlobalInvocationID.xyz;
+  const uvec3 activeGid3 = gl_GlobalInvocationID.xyz;
+  const uint activeWidth = params.activeWidth == 0u ? params.width : params.activeWidth;
+  const uint activeHeight = params.activeHeight == 0u ? params.height : params.activeHeight;
+  if (activeGid3.x >= activeWidth || activeGid3.y >= activeHeight) {
+    return;
+  }
+  const uvec3 gid3 = uvec3(activeGid3.xy + uvec2(params.activeOriginX, params.activeOriginY), activeGid3.z);
   if (gid3.x >= params.width || gid3.y >= params.height) {
     return;
   }

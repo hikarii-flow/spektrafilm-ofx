@@ -139,6 +139,10 @@ constexpr SpektraAppParamDescriptor kParams[] = {
   param("hdrExposureEv", "HDR Exposure EV", "color", SpektraAppParamKindDouble, kParamTagFlow, 0, 0.0, 0.0, 0.0, -8.0, 8.0),
   param("hdrToneMapping", "HDR Tone Mapping", "color", SpektraAppParamKindChoice, kParamTagFlow, 1, 0.0, 0.0, 0.0, 0.0, 1.0, "hdrToneMapping"),
   param("colorAdaptation", "Color Adaptation", "color", SpektraAppParamKindBool, kParamTagFlow, 0, 0.0, 0.0, 0.0, 0.0, 1.0),
+  param("colorAdaptationInputCompression", "Input Compression", "color", SpektraAppParamKindBool, kParamTagNone, 1, 0.0, 0.0, 0.0, 0.0, 1.0),
+  param("colorAdaptationCurveSmoothing", "Curve Smoothing", "color", SpektraAppParamKindBool, kParamTagNone, 1, 0.0, 0.0, 0.0, 0.0, 1.0),
+  param("colorAdaptationOutputLightnessCompression", "Output Lightness Compression", "color", SpektraAppParamKindBool, kParamTagNone, 1, 0.0, 0.0, 0.0, 0.0, 1.0),
+  param("colorAdaptationOutputChromaCompression", "Output Chroma Compression", "color", SpektraAppParamKindBool, kParamTagNone, 1, 0.0, 0.0, 0.0, 0.0, 1.0),
 
   param("rawWhiteBalanceMode", "White Balance", "raw", SpektraAppParamKindChoice, kParamTagFlow, 0, 0.0, 0.0, 0.0, 0.0, 2.0, "rawWhiteBalance"),
   param("rawTemperature", "Temperature", "raw", SpektraAppParamKindDouble, kParamTagFlow, 0, 5500.0, 0.0, 0.0, 2000.0, 50000.0),
@@ -295,6 +299,10 @@ spektrafilm::RenderParams toRendererParams(const SpektraAppRenderParams &p) {
   out.hdrExposureEv = p.hdrExposureEv;
   out.hdrToneMapping = static_cast<spektrafilm::HdrToneMapping>(p.hdrToneMapping);
   out.colorAdaptation = p.colorAdaptation != 0;
+  out.colorAdaptationInputCompression = p.colorAdaptationInputCompression != 0;
+  out.colorAdaptationCurveSmoothing = p.colorAdaptationCurveSmoothing != 0;
+  out.colorAdaptationOutputLightnessCompression = p.colorAdaptationOutputLightnessCompression != 0;
+  out.colorAdaptationOutputChromaCompression = p.colorAdaptationOutputChromaCompression != 0;
   out.film = p.film;
   out.paper = p.paper;
   out.printTiming = static_cast<spektrafilm::PrintTimingMode>(p.printTiming);
@@ -553,6 +561,10 @@ SpektraAppRenderParams SpektraAppMakeDefaultRenderParams(void) {
   p.hdrPeakNits = 1000.0f;
   p.hdrToneMapping = static_cast<int32_t>(spektrafilm::HdrToneMapping::HardClip);
   p.colorAdaptation = 0;
+  p.colorAdaptationInputCompression = 1;
+  p.colorAdaptationCurveSmoothing = 1;
+  p.colorAdaptationOutputLightnessCompression = 1;
+  p.colorAdaptationOutputChromaCompression = 1;
   p.film = static_cast<int32_t>(spektrafilm::kSpektraDefaultFilmIndex);
   p.paper = static_cast<int32_t>(spektrafilm::kSpektraDefaultPaperIndex);
   p.printTiming = static_cast<int32_t>(spektrafilm::PrintTimingMode::FilteredEnlarger);
@@ -694,6 +706,10 @@ int32_t SpektraAppSetBoolParam(SpektraAppRenderParams *p, const char *name, int3
   const int32_t flag = value ? 1 : 0;
   if (sameName(name, "cameraUvFilterEnabled")) p->cameraUvFilterEnabled = flag;
   else if (sameName(name, "colorAdaptation")) p->colorAdaptation = flag;
+  else if (sameName(name, "colorAdaptationInputCompression")) p->colorAdaptationInputCompression = flag;
+  else if (sameName(name, "colorAdaptationCurveSmoothing")) p->colorAdaptationCurveSmoothing = flag;
+  else if (sameName(name, "colorAdaptationOutputLightnessCompression")) p->colorAdaptationOutputLightnessCompression = flag;
+  else if (sameName(name, "colorAdaptationOutputChromaCompression")) p->colorAdaptationOutputChromaCompression = flag;
   else if (sameName(name, "cameraIrFilterEnabled")) p->cameraIrFilterEnabled = flag;
   else if (sameName(name, "autoExposure")) p->autoExposure = flag;
   else if (sameName(name, "printerLightsGang")) p->printerLightsGang = flag;

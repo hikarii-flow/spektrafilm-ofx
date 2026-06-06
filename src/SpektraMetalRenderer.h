@@ -33,6 +33,8 @@ public:
   const MetalRenderDiagnostics &lastDiagnostics() const override;
   const std::string &lastError() const override;
   void releaseTransientResources() override;
+  bool startGpuTraceCapture(const std::string &path);
+  void stopGpuTraceCapture();
 
   bool render(
     const ImageView &source,

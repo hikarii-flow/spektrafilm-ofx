@@ -161,7 +161,7 @@ struct KernelParams {
   float hdrPeakNits;
   float hdrExposureEv;
   int32_t hdrToneMapping;
-  uint32_t colorAdaptationEnabled;
+  uint32_t colorAdaptationFlags;
   int32_t film;
   int32_t paper;
   int32_t printTiming;
@@ -493,13 +493,16 @@ struct StaticProfileResources {
   id<MTLBuffer> paperDensityCurvesBuffer = nil;
   id<MTLBuffer> filmChannelDensityBuffer = nil;
   id<MTLBuffer> filmBaseDensityBuffer = nil;
+  id<MTLBuffer> filmSpectralDensityBuffer = nil;
   id<MTLBuffer> paperLogSensitivityBuffer = nil;
   id<MTLBuffer> thKg3IlluminantBuffer = nil;
   id<MTLBuffer> customEnlargerFiltersBuffer = nil;
   id<MTLBuffer> neutralPrintFiltersBuffer = nil;
   id<MTLBuffer> academyPrinterDensityDataBuffer = nil;
   id<MTLBuffer> paperScanDensityDataBuffer = nil;
+  id<MTLBuffer> paperSpectralDensityBuffer = nil;
   id<MTLBuffer> scanIlluminantsAndCmfsBuffer = nil;
+  id<MTLBuffer> scanProductsBuffer = nil;
   id<MTLBuffer> scanToOutputRgbDataBuffer = nil;
   id<MTLBuffer> colorEncodeLutBuffer = nil;
 
@@ -532,13 +535,16 @@ struct StaticProfileResources {
            paperDensityCurvesBuffer &&
            filmChannelDensityBuffer &&
            filmBaseDensityBuffer &&
+           filmSpectralDensityBuffer &&
            paperLogSensitivityBuffer &&
            thKg3IlluminantBuffer &&
            customEnlargerFiltersBuffer &&
            neutralPrintFiltersBuffer &&
            academyPrinterDensityDataBuffer &&
            paperScanDensityDataBuffer &&
+           paperSpectralDensityBuffer &&
            scanIlluminantsAndCmfsBuffer &&
+           scanProductsBuffer &&
            scanToOutputRgbDataBuffer &&
            colorEncodeLutBuffer;
   }
@@ -575,13 +581,16 @@ struct StaticProfileResources {
     paperDensityCurvesBuffer = nil;
     filmChannelDensityBuffer = nil;
     filmBaseDensityBuffer = nil;
+    filmSpectralDensityBuffer = nil;
     paperLogSensitivityBuffer = nil;
     thKg3IlluminantBuffer = nil;
     customEnlargerFiltersBuffer = nil;
     neutralPrintFiltersBuffer = nil;
     academyPrinterDensityDataBuffer = nil;
     paperScanDensityDataBuffer = nil;
+    paperSpectralDensityBuffer = nil;
     scanIlluminantsAndCmfsBuffer = nil;
+    scanProductsBuffer = nil;
     scanToOutputRgbDataBuffer = nil;
     colorEncodeLutBuffer = nil;
   }
@@ -904,7 +913,7 @@ KernelParams toKernelParams(const RenderParams &params, double time, int32_t wid
   out.hdrPeakNits = params.hdrPeakNits;
   out.hdrExposureEv = params.hdrExposureEv;
   out.hdrToneMapping = static_cast<int32_t>(params.hdrToneMapping);
-  out.colorAdaptationEnabled = params.colorAdaptation ? 1u : 0u;
+  out.colorAdaptationFlags = colorAdaptationFlags(params);
   out.film = params.film;
   out.paper = params.paper;
   out.printTiming = static_cast<int32_t>(params.printTiming);
@@ -1417,6 +1426,60 @@ std::vector<float> makeLinearSensitivity(const float *logSensitivity, uint32_t w
     linear[i] = std::isfinite(value) ? value : 0.0f;
   }
   return linear;
+}
+
+std::vector<float> makePackedSpectralDensity(
+  const float *channelDensity,
+  const float *baseDensity,
+  uint32_t wavelengthCount
+) {
+  std::vector<float> packed(static_cast<size_t>(wavelengthCount) * 4u, 0.0f);
+  for (uint32_t wavelength = 0u; wavelength < wavelengthCount; ++wavelength) {
+    const size_t sourceOffset = static_cast<size_t>(wavelength) * 3u;
+    const size_t packedOffset = static_cast<size_t>(wavelength) * 4u;
+    packed[packedOffset] = channelDensity[sourceOffset];
+    packed[packedOffset + 1u] = channelDensity[sourceOffset + 1u];
+    packed[packedOffset + 2u] = channelDensity[sourceOffset + 2u];
+    packed[packedOffset + 3u] = baseDensity[wavelength];
+  }
+  return packed;
+}
+
+std::vector<float> makeScanProducts(
+  const float *filmIlluminant,
+  const float *paperIlluminant,
+  const float *filmBaseDensity,
+  const float *paperBaseDensity,
+  const float *cmfs,
+  uint32_t wavelengthCount
+) {
+  const size_t packedFloatCount = static_cast<size_t>(wavelengthCount) * 8u;
+  const size_t legacyFloatCount = static_cast<size_t>(wavelengthCount) * 6u;
+  std::vector<float> products(packedFloatCount + legacyFloatCount + 2u, 0.0f);
+  const float *illuminants[] = {filmIlluminant, paperIlluminant};
+  const float *baseDensities[] = {filmBaseDensity, paperBaseDensity};
+  for (uint32_t stage = 0u; stage < 2u; ++stage) {
+    float normalization = 0.0f;
+    const size_t packedStageOffset = static_cast<size_t>(stage) * wavelengthCount * 4u;
+    const size_t legacyStageOffset = packedFloatCount + static_cast<size_t>(stage) * wavelengthCount * 3u;
+    for (uint32_t wavelength = 0u; wavelength < wavelengthCount; ++wavelength) {
+      const size_t channelOffset = static_cast<size_t>(wavelength) * 3u;
+      const size_t packedOffset = packedStageOffset + static_cast<size_t>(wavelength) * 4u;
+      const size_t legacyOffset = legacyStageOffset + channelOffset;
+      const float illuminant = illuminants[stage][wavelength];
+      const float baseTransmittanceRaw = std::pow(10.0f, -baseDensities[stage][wavelength]);
+      const float baseTransmittance = std::isfinite(baseTransmittanceRaw) ? baseTransmittanceRaw : 0.0f;
+      for (uint32_t channel = 0u; channel < 3u; ++channel) {
+        const float product = illuminant * cmfs[channelOffset + channel];
+        products[packedOffset + channel] = baseTransmittance * product;
+        products[legacyOffset + channel] = product;
+      }
+      normalization += products[legacyOffset + 1u];
+    }
+    products[packedFloatCount + legacyFloatCount + stage] =
+      1.0f / std::max(normalization, 1.0e-10f);
+  }
+  return products;
 }
 
 float smoothErfEdge(float wavelength, float center, float width) {
@@ -2449,10 +2512,13 @@ struct MetalRenderer::Impl {
   id<MTLComputePipelineState> grainSynthesisLayersFromTargetDensityNonLayeredTexturePipeline = nil;
   id<MTLComputePipelineState> grainSynthesisLayersFromTargetDensityNonLayeredTextureFixedRadiusPipeline = nil;
   id<MTLComputePipelineState> grainSynthesisResolveDensityPipeline = nil;
+  id<MTLComputePipelineState> filteredEnlargerResponsePipeline = nil;
   id<MTLComputePipelineState> frameConstantsPipeline = nil;
   id<MTLComputePipelineState> finalFromFilmDensityPipeline = nil;
   id<MTLComputePipelineState> printRawFromFilmDensityPipeline = nil;
   id<MTLComputePipelineState> printDensityFromPrintRawPipeline = nil;
+  id<MTLComputePipelineState> profilePrintScanFromDensityPipeline = nil;
+  id<MTLComputePipelineState> profileFinalizeOutputPipeline = nil;
   id<MTLComputePipelineState> finalFromPrintRawPipeline = nil;
   id<MTLComputePipelineState> printGlareGeneratePipeline = nil;
   id<MTLComputePipelineState> printGlareBlurXPipeline = nil;
@@ -2489,6 +2555,7 @@ struct MetalRenderer::Impl {
   bool halationGroupedTail = false;
   bool grainBlurRecurrence = true;
   bool useLegacyGrainSynthesis = false;
+  bool linearFinalOutput = false;
   GrainSynthesisSamplerMode grainSynthesisSamplerMode = GrainSynthesisSamplerMode::R2;
   GrainSynthesisCellMode grainSynthesisCellMode = GrainSynthesisCellMode::OffsetList;
   GrainSynthesisTargetStorageMode grainSynthesisTargetStorageMode = GrainSynthesisTargetStorageMode::FloatBuffer;
@@ -2505,6 +2572,7 @@ struct MetalRenderer::Impl {
   std::string diffusionClusterSigma = "0.10";
   std::string densityCurveLookup = "binary";
   std::string spectralTransmittance = "pow";
+  std::string finalCoreMode = "fused";
   std::unordered_map<int, MPSImageGaussianBlur *> mpsGaussianBlurCache;
   uint32_t forcedThreadgroupWidth = 0;
   uint32_t forcedThreadgroupHeight = 0;
@@ -2760,6 +2828,46 @@ struct MetalRenderer::Impl {
     return false;
   }
 
+  bool supportsStageCounterSampling() const {
+    if (!device || ![device respondsToSelector:@selector(supportsCounterSampling:)]) {
+      return false;
+    }
+    if (@available(macOS 11.0, *)) {
+      return [device supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary];
+    }
+    return false;
+  }
+
+  double commandBufferGpuMilliseconds(id<MTLCommandBuffer> buffer) const {
+    if (!buffer) {
+      return 0.0;
+    }
+    const CFTimeInterval gpuStart = [buffer GPUStartTime];
+    const CFTimeInterval gpuEnd = [buffer GPUEndTime];
+    if (!(gpuEnd > gpuStart) || gpuStart <= 0.0) {
+      return 0.0;
+    }
+    return (gpuEnd - gpuStart) * 1000.0;
+  }
+
+  void populateDeviceDiagnostics() {
+    diagnostics.metalDeviceName = device && [device name] ? [[device name] UTF8String] : "";
+    diagnostics.passDispatchCounterSamplingSupported = supportsDispatchCounterSampling();
+    diagnostics.passStageCounterSamplingSupported = supportsStageCounterSampling();
+    if (!device) {
+      return;
+    }
+    if ([device respondsToSelector:@selector(recommendedMaxWorkingSetSize)]) {
+      diagnostics.metalRecommendedMaxWorkingSetSize = static_cast<uint64_t>([device recommendedMaxWorkingSetSize]);
+    }
+    if ([device respondsToSelector:@selector(currentAllocatedSize)]) {
+      diagnostics.metalCurrentAllocatedSize = static_cast<uint64_t>([device currentAllocatedSize]);
+    }
+    if ([device respondsToSelector:@selector(maxBufferLength)]) {
+      diagnostics.metalMaxBufferLength = static_cast<uint64_t>([device maxBufferLength]);
+    }
+  }
+
   double timestampTicksToMilliseconds(uint64_t ticks) const {
     if (ticks == MTLCounterErrorValue) {
       return 0.0;
@@ -2919,6 +3027,16 @@ struct MetalRenderer::Impl {
     const std::vector<float> baseFilmSensitivityLinear = makeLinearSensitivity(filmCurves->logSensitivity, filmCurves->wavelengthCount);
     const std::vector<float> filmSensitivityLinear = applyCameraBandPass(*filmCurves, baseFilmSensitivityLinear, params);
     const std::vector<float> paperSensitivityLinear = makeLinearSensitivity(paperCurves->logSensitivity, paperCurves->wavelengthCount);
+    const std::vector<float> filmSpectralDensity = makePackedSpectralDensity(
+      filmCurves->channelDensity,
+      filmCurves->baseDensity,
+      filmCurves->wavelengthCount
+    );
+    const std::vector<float> paperSpectralDensity = makePackedSpectralDensity(
+      paperCurves->channelDensity,
+      paperCurves->baseDensity,
+      paperCurves->wavelengthCount
+    );
     const std::array<float, 9> mallettRawMatrix = makeMallettRawMatrix(
       *filmCurves,
       filmSensitivityLinear
@@ -2947,6 +3065,14 @@ struct MetalRenderer::Impl {
     scanIlluminantsAndCmfs.insert(scanIlluminantsAndCmfs.end(), filmCurves->scanIlluminant, filmCurves->scanIlluminant + filmCurves->wavelengthCount);
     scanIlluminantsAndCmfs.insert(scanIlluminantsAndCmfs.end(), paperCurves->scanIlluminant, paperCurves->scanIlluminant + filmCurves->wavelengthCount);
     scanIlluminantsAndCmfs.insert(scanIlluminantsAndCmfs.end(), standardObserverCmfs(), standardObserverCmfs() + filmCurves->wavelengthCount * 3u);
+    const std::vector<float> scanProducts = makeScanProducts(
+      filmCurves->scanIlluminant,
+      paperCurves->scanIlluminant,
+      filmCurves->baseDensity,
+      paperCurves->baseDensity,
+      standardObserverCmfs(),
+      filmCurves->wavelengthCount
+    );
 
     std::vector<float> scanToOutputRgbData;
     scanToOutputRgbData.reserve(static_cast<size_t>(kSpektraColorSpaceCount) * 18u);
@@ -2979,6 +3105,7 @@ struct MetalRenderer::Impl {
     next.paperDensityCurvesBuffer = newStaticBuffer(paperCurves->densityCurves, paperDensityCurveBytes, "paper density curves");
     next.filmChannelDensityBuffer = newStaticBuffer(filmCurves->channelDensity, sensitivityBytes, "film channel density");
     next.filmBaseDensityBuffer = newStaticBuffer(filmCurves->baseDensity, baseDensityBytes, "film base density");
+    next.filmSpectralDensityBuffer = newStaticBuffer(filmSpectralDensity.data(), filmSpectralDensity.size() * sizeof(float), "packed film spectral density");
     next.paperLogSensitivityBuffer = newStaticBuffer(paperSensitivityLinear.data(), sensitivityBytes, "paper linear sensitivity");
     next.thKg3IlluminantBuffer = newStaticBuffer(thKg3Illuminant(), baseDensityBytes, "TH-KG3 illuminant");
     next.customEnlargerFiltersBuffer = newStaticBuffer(customEnlargerFilters(), sensitivityBytes, "custom enlarger filters");
@@ -2989,7 +3116,9 @@ struct MetalRenderer::Impl {
       "Academy printer density data"
     );
     next.paperScanDensityDataBuffer = newStaticBuffer(paperScanDensityData.data(), paperScanDensityData.size() * sizeof(float), "paper scan density data");
+    next.paperSpectralDensityBuffer = newStaticBuffer(paperSpectralDensity.data(), paperSpectralDensity.size() * sizeof(float), "packed paper spectral density");
     next.scanIlluminantsAndCmfsBuffer = newStaticBuffer(scanIlluminantsAndCmfs.data(), scanIlluminantsAndCmfs.size() * sizeof(float), "scan illuminants and CMFs");
+    next.scanProductsBuffer = newStaticBuffer(scanProducts.data(), scanProducts.size() * sizeof(float), "scan CMF products and inverse normalizations");
     next.scanToOutputRgbDataBuffer = newStaticBuffer(scanToOutputRgbData.data(), scanToOutputRgbData.size() * sizeof(float), "scan output matrices");
     next.colorEncodeLutBuffer = newStaticBuffer(colorEncodeAndGamutData.data(), colorEncodeAndGamutData.size() * sizeof(float), "color encode LUT and output gamut compression");
 
@@ -3008,6 +3137,7 @@ struct MetalRenderer::Impl {
     @autoreleasepool {
       preferPrivateScratch = envString("SPEKTRAFILM_SCRATCH_STORAGE", "private") != "shared";
       useLegacyGrainSynthesis = envFlagEnabled("SPEKTRAFILM_GRAIN_SYNTHESIS_LEGACY");
+      linearFinalOutput = envFlagEnabled("SPEKTRAFILM_LINEAR_FINAL_OUTPUT");
       const std::string grainSamplerText = envString("SPEKTRAFILM_GRAIN_SYNTHESIS_SAMPLER", "r2");
       if (grainSamplerText == "antithetic") {
         grainSynthesisSamplerMode = GrainSynthesisSamplerMode::Antithetic;
@@ -3099,6 +3229,10 @@ struct MetalRenderer::Impl {
       } else {
         spectralTransmittance = "pow";
         spectralTransmittanceMode = SpectralTransmittanceMode::Pow;
+      }
+      finalCoreMode = envString("SPEKTRAFILM_FINAL_CORE_MODE", "fused");
+      if (finalCoreMode != "fused" && finalCoreMode != "staged") {
+        finalCoreMode = "fused";
       }
       const std::string diffusionGroupSizeText = envString("SPEKTRAFILM_DIFFUSION_GROUP_SIZE", "2");
       if (diffusionGroupSizeText == "1") {
@@ -3250,10 +3384,13 @@ struct MetalRenderer::Impl {
       grainSynthesisLayersFromTargetDensityNonLayeredTexturePipeline = makePipeline(@"spektrafilm_grain_synthesis_layers_from_target_density_nonlayered_r16_texture_array");
       grainSynthesisLayersFromTargetDensityNonLayeredTextureFixedRadiusPipeline = makePipeline(@"spektrafilm_grain_synthesis_layers_from_target_density_nonlayered_r16_texture_array_fixed_radius");
       grainSynthesisResolveDensityPipeline = makePipeline(@"spektrafilm_grain_synthesis_resolve_density");
+      filteredEnlargerResponsePipeline = makePipeline(@"spektrafilm_filtered_enlarger_response");
       frameConstantsPipeline = makePipeline(@"spektrafilm_frame_constants");
       finalFromFilmDensityPipeline = makePipeline(@"spektrafilm_final_from_film_density");
       printRawFromFilmDensityPipeline = makePipeline(@"spektrafilm_print_raw_from_film_density");
       printDensityFromPrintRawPipeline = makePipeline(@"spektrafilm_print_density_from_print_raw");
+      profilePrintScanFromDensityPipeline = makePipeline(@"spektrafilm_profile_print_scan_from_density");
+      profileFinalizeOutputPipeline = makePipeline(@"spektrafilm_profile_finalize_output");
       finalFromPrintRawPipeline = makePipeline(@"spektrafilm_final_from_print_raw");
       printGlareGeneratePipeline = makePipeline(@"spektrafilm_print_glare_generate");
       printGlareBlurXPipeline = makePipeline(@"spektrafilm_print_glare_blur_x");
@@ -3316,8 +3453,9 @@ struct MetalRenderer::Impl {
           !grainSynthesisLayersFromTargetDensityNonLayeredTexturePipeline ||
           !grainSynthesisLayersFromTargetDensityNonLayeredTextureFixedRadiusPipeline ||
           !grainSynthesisResolveDensityPipeline ||
-          !frameConstantsPipeline || !finalFromFilmDensityPipeline ||
-          !printRawFromFilmDensityPipeline || !finalFromPrintRawPipeline ||
+          !filteredEnlargerResponsePipeline || !frameConstantsPipeline || !finalFromFilmDensityPipeline ||
+          !printRawFromFilmDensityPipeline || !printDensityFromPrintRawPipeline ||
+          !profilePrintScanFromDensityPipeline || !profileFinalizeOutputPipeline || !finalFromPrintRawPipeline ||
           !printGlareGeneratePipeline || !printGlareBlurXPipeline || !printGlareBlurYPipeline ||
           !printGlareApplyPipeline ||
           !scannerBlurXPipeline || !scannerBlurYPipeline || !unsharpBlurXPipeline || !unsharpBlurYPipeline ||
@@ -3422,8 +3560,10 @@ bool MetalRenderer::isAvailable() const {
     impl_->grainSynthesisLayersFromTargetDensityNonLayeredTexturePipeline &&
     impl_->grainSynthesisLayersFromTargetDensityNonLayeredTextureFixedRadiusPipeline &&
     impl_->grainSynthesisResolveDensityPipeline &&
-    impl_->frameConstantsPipeline && impl_->finalFromFilmDensityPipeline && impl_->printRawFromFilmDensityPipeline &&
-    impl_->printDensityFromPrintRawPipeline && impl_->finalFromPrintRawPipeline &&
+    impl_->filteredEnlargerResponsePipeline && impl_->frameConstantsPipeline &&
+    impl_->finalFromFilmDensityPipeline && impl_->printRawFromFilmDensityPipeline &&
+    impl_->printDensityFromPrintRawPipeline && impl_->profilePrintScanFromDensityPipeline &&
+    impl_->profileFinalizeOutputPipeline && impl_->finalFromPrintRawPipeline &&
     impl_->scannerBlurXPipeline && impl_->scannerBlurYPipeline &&
     impl_->unsharpBlurXPipeline && impl_->unsharpBlurYPipeline &&
     impl_->bufferToTexturePipeline && impl_->textureToBufferPipeline &&
@@ -3450,6 +3590,53 @@ void MetalRenderer::releaseTransientResources() {
   std::lock_guard<std::mutex> renderLock(impl_->renderMutex);
   @autoreleasepool {
     impl_->releaseTransientResources();
+  }
+}
+
+bool MetalRenderer::startGpuTraceCapture(const std::string &path) {
+  if (!isAvailable()) {
+    return false;
+  }
+  if (path.empty()) {
+    impl_->lastError = "GPU trace capture requires a non-empty output path.";
+    return false;
+  }
+  if (@available(macOS 10.15, *)) {
+    MTLCaptureManager *manager = [MTLCaptureManager sharedCaptureManager];
+    if ([manager isCapturing]) {
+      impl_->lastError = "A Metal GPU trace capture is already active.";
+      return false;
+    }
+    if (![manager supportsDestination:MTLCaptureDestinationGPUTraceDocument]) {
+      impl_->lastError = "This Metal runtime does not support writing GPU trace documents.";
+      return false;
+    }
+    MTLCaptureDescriptor *descriptor = [MTLCaptureDescriptor new];
+    descriptor.captureObject = impl_->commandQueue ? (id)impl_->commandQueue : (id)impl_->device;
+    descriptor.destination = MTLCaptureDestinationGPUTraceDocument;
+    NSString *capturePath = [NSString stringWithUTF8String:path.c_str()];
+    descriptor.outputURL = [NSURL fileURLWithPath:capturePath];
+    NSError *error = nil;
+    if (![manager startCaptureWithDescriptor:descriptor error:&error]) {
+      impl_->lastError = error ? [[error localizedDescription] UTF8String] : "Unable to start Metal GPU trace capture.";
+      impl_->lastError += " Set MTL_CAPTURE_ENABLED=1 for command-line captures.";
+      return false;
+    }
+    return true;
+  }
+  impl_->lastError = "Programmatic Metal GPU trace capture requires macOS 10.15 or newer.";
+  return false;
+}
+
+void MetalRenderer::stopGpuTraceCapture() {
+  if (!impl_) {
+    return;
+  }
+  if (@available(macOS 10.15, *)) {
+    MTLCaptureManager *manager = [MTLCaptureManager sharedCaptureManager];
+    if ([manager isCapturing]) {
+      [manager stopCapture];
+    }
   }
 }
 
@@ -3485,6 +3672,7 @@ bool MetalRenderer::render(
     impl_->diagnostics.renderSerialized = true;
     impl_->diagnostics.privateScratchEnabled = impl_->preferPrivateScratch;
     impl_->diagnostics.passGpuTimingEnabled = impl_->passGpuTimingEnabled;
+    impl_->populateDeviceDiagnostics();
     impl_->diagnostics.diffusionGroupSize = impl_->diffusionGroupSize;
     impl_->diagnostics.threadgroupMode = impl_->threadgroupMode;
     impl_->diagnostics.blurBackend = impl_->blurBackend;
@@ -3493,6 +3681,7 @@ bool MetalRenderer::render(
     impl_->diagnostics.diffusionClusterSigma = impl_->diffusionClusterSigma;
     impl_->diagnostics.densityCurveLookup = impl_->densityCurveLookup;
     impl_->diagnostics.spectralTransmittance = impl_->spectralTransmittance;
+    impl_->diagnostics.finalCoreMode = "fused";
     impl_->diagnostics.halationGroupedTail = impl_->halationGroupedTail;
     impl_->diagnostics.scannerMps = impl_->scannerMps;
     impl_->diagnostics.grainBlurRecurrence = impl_->grainBlurRecurrence;
@@ -3679,13 +3868,16 @@ bool MetalRenderer::render(
     id<MTLBuffer> paperDensityCurvesBuffer = resources.paperDensityCurvesBuffer;
     id<MTLBuffer> filmChannelDensityBuffer = resources.filmChannelDensityBuffer;
     id<MTLBuffer> filmBaseDensityBuffer = resources.filmBaseDensityBuffer;
+    id<MTLBuffer> filmSpectralDensityBuffer = resources.filmSpectralDensityBuffer;
     id<MTLBuffer> paperLogSensitivityBuffer = resources.paperLogSensitivityBuffer;
     id<MTLBuffer> thKg3IlluminantBuffer = resources.thKg3IlluminantBuffer;
     id<MTLBuffer> customEnlargerFiltersBuffer = resources.customEnlargerFiltersBuffer;
     id<MTLBuffer> neutralPrintFiltersBuffer = resources.neutralPrintFiltersBuffer;
     id<MTLBuffer> academyPrinterDensityDataBuffer = resources.academyPrinterDensityDataBuffer;
     id<MTLBuffer> paperScanDensityDataBuffer = resources.paperScanDensityDataBuffer;
+    id<MTLBuffer> paperSpectralDensityBuffer = resources.paperSpectralDensityBuffer;
     id<MTLBuffer> scanIlluminantsAndCmfsBuffer = resources.scanIlluminantsAndCmfsBuffer;
+    id<MTLBuffer> scanProductsBuffer = resources.scanProductsBuffer;
     id<MTLBuffer> scanToOutputRgbDataBuffer = resources.scanToOutputRgbDataBuffer;
     id<MTLBuffer> colorEncodeLutBuffer = resources.colorEncodeLutBuffer;
 
@@ -3776,8 +3968,16 @@ bool MetalRenderer::render(
       ? MTLPixelFormatRGBA16Float
       : MTLPixelFormatRGBA32Float;
     const bool directFinalEncodePath = finalPostProcessPath && !printGlarePath && !scannerNeedsBlur && !scannerNeedsUnsharp;
+    const bool stagedFinalCorePath =
+      impl_->finalCoreMode == "staged" &&
+      finalPrintSimulation &&
+      !printDiffusionPath &&
+      directFinalEncodePath;
+    impl_->diagnostics.finalCoreMode = stagedFinalCorePath ? "staged" : "fused";
     impl_->diagnostics.scannerTextureIntermediates = scannerTexturePath;
     const bool needsFrameConstants = needsFilmDensityPath || printDiffusionPath;
+    const NSUInteger filteredEnlargerResponseBytes =
+      static_cast<NSUInteger>(filmCurves->wavelengthCount) * 8u * sizeof(float);
     const NSUInteger diffusionTempBytes = bufferBytes * static_cast<NSUInteger>(std::max(impl_->diffusionGroupSize, 1u));
     const bool diffusionDownsamplePath = impl_->blurDownsample != "off" &&
       (anyDiffusionComponentDownsamples(cameraDiffusionComponents, impl_->blurDownsample) ||
@@ -3796,7 +3996,12 @@ bool MetalRenderer::render(
           kHalationBoostMaxChunkPixels - 1u) / kHalationBoostMaxChunkPixels)
       : 0u;
     id<MTLBuffer> frameConstantsBuffer = needsFrameConstants ? impl_->gpuScratchBuffer(sizeof(float) * 16u, "frame constants") : nil;
-    id<MTLBuffer> scannerRgbBufferA = (finalPostProcessPath && !directFinalEncodePath) ? impl_->gpuScratchBuffer(bufferBytes, "scanner rgb A") : nil;
+    id<MTLBuffer> filteredEnlargerResponseBuffer = printSimulationPath
+      ? impl_->gpuScratchBuffer(filteredEnlargerResponseBytes, "filtered enlarger response")
+      : nil;
+    id<MTLBuffer> scannerRgbBufferA = ((finalPostProcessPath && !directFinalEncodePath) || stagedFinalCorePath)
+      ? impl_->gpuScratchBuffer(bufferBytes, "scanner rgb A")
+      : nil;
     id<MTLBuffer> scannerRgbBufferB = (!scannerTexturePath && (scannerNeedsBlur || scannerNeedsUnsharp)) ? impl_->gpuScratchBuffer(bufferBytes, "scanner rgb B") : nil;
     id<MTLBuffer> scannerRgbBufferC = (!scannerTexturePath && scannerNeedsUnsharp) ? impl_->gpuScratchBuffer(bufferBytes, "scanner rgb C") : nil;
     id<MTLTexture> scannerTextureA = scannerTexturePath ? impl_->gpuScratchTexture(width, height, "scanner texture A", blurTextureFormat) : nil;
@@ -3834,8 +4039,12 @@ bool MetalRenderer::render(
     id<MTLBuffer> diffusionDownsampleBlurBuffer = diffusionDownsamplePath
       ? impl_->gpuScratchBuffer(diffusionDownsampleGroupBytes, "diffusion downsample blur")
       : nil;
-    id<MTLBuffer> printRawBufferA = (printDiffusionPath || printStageOutput) ? impl_->gpuScratchBuffer(bufferBytes, "print raw A") : nil;
-    id<MTLBuffer> printRawBufferB = printDiffusionPath ? impl_->gpuScratchBuffer(diffusionTempBytes, "print raw B") : nil;
+    id<MTLBuffer> printRawBufferA = (printDiffusionPath || printStageOutput || stagedFinalCorePath)
+      ? impl_->gpuScratchBuffer(bufferBytes, "print raw A")
+      : nil;
+    id<MTLBuffer> printRawBufferB = (printDiffusionPath || stagedFinalCorePath)
+      ? impl_->gpuScratchBuffer(printDiffusionPath ? diffusionTempBytes : bufferBytes, "print raw B")
+      : nil;
     id<MTLBuffer> printRawBufferC = printDiffusionPath ? impl_->gpuScratchBuffer(bufferBytes, "print raw C") : nil;
     id<MTLBuffer> dirInfoBuffer = dirPath ? impl_->sharedScratchBuffer(sizeof(KernelDirInfo), "DIR info") : nil;
     id<MTLBuffer> dirCorrectedDensityCurvesBuffer = dirPath ? impl_->sharedScratchBuffer(densityCurveBytes, "DIR corrected curves") : nil;
@@ -3887,6 +4096,7 @@ bool MetalRenderer::render(
       ? impl_->sharedScratchBuffer(sizeof(KernelGrainSynthesisCellOffset) * kGrainSynthesisComponentCount * kGrainSynthesisMaxCellOffsetsPerComponent, "grain synthesis cell offsets")
       : nil;
     if (!srcBuffer || !dstBuffer || !paramBuffer || (needsFrameConstants && !frameConstantsBuffer) ||
+        (printSimulationPath && !filteredEnlargerResponseBuffer) ||
         (sourceTransformPath && !enlargedSourceBuffer)) {
       impl_->lastError = "Unable to allocate Metal staging buffers.";
       return false;
@@ -3945,6 +4155,10 @@ bool MetalRenderer::render(
     }
     if ((printDiffusionPath || printStageOutput) && !printRawBufferA) {
       impl_->lastError = "Unable to allocate print stage Metal buffers.";
+      return false;
+    }
+    if (stagedFinalCorePath && (!printRawBufferA || !printRawBufferB || !scannerRgbBufferA)) {
+      impl_->lastError = "Unable to allocate staged final-core profiling buffers.";
       return false;
     }
     if (printDiffusionPath && (!printDiffusionInfoBuffer || !printDiffusionComponentsBuffer ||
@@ -4049,28 +4263,6 @@ bool MetalRenderer::render(
     const auto commandEncodingStart = PerfClock::now();
     id<MTLCommandBuffer> commandBuffer = nil;
     id<MTLComputeCommandEncoder> encoder = nil;
-    bool encodeFailed = false;
-    auto beginComputeEncoder = [&]() -> bool {
-      encoder = [commandBuffer computeCommandEncoder];
-      if (!encoder) {
-        impl_->lastError = "Unable to create Metal command encoder.";
-        return false;
-      }
-      return true;
-    };
-    auto beginCommandEncoder = [&]() -> bool {
-      id<MTLCommandQueue> queue = externalMetal ? externalMetal->commandQueue : impl_->commandQueue;
-      commandBuffer = [queue commandBuffer];
-      if (!commandBuffer) {
-        impl_->lastError = "Unable to create Metal command buffer.";
-        return false;
-      }
-      return beginComputeEncoder();
-    };
-    if (!beginCommandEncoder()) {
-      return false;
-    }
-
     constexpr NSUInteger kMaxCounterSamples = 2048u;
     id<MTLCounterSampleBuffer> passCounterBuffer = nil;
     const std::string requestedPassTiming = externalMetal ? std::string("off") : impl_->passTimingMode;
@@ -4100,22 +4292,67 @@ bool MetalRenderer::render(
     }
     if (useSplitPassTiming) {
       impl_->diagnostics.passGpuTimingAvailable = true;
-      impl_->diagnostics.passTimingMode = "split";
+      impl_->diagnostics.passTimingMode = "split-diagnostic";
     } else if (impl_->passGpuTimingEnabled && !passCounterBuffer) {
       impl_->diagnostics.passTimingMode = "unavailable";
+    }
+    bool encodeFailed = false;
+    auto beginComputeEncoder = [&]() -> bool {
+      if (passCounterBuffer) {
+        if (@available(macOS 10.15, *)) {
+          MTLComputePassDescriptor *descriptor = [MTLComputePassDescriptor computePassDescriptor];
+          MTLComputePassSampleBufferAttachmentDescriptor *attachment =
+            [descriptor.sampleBufferAttachments objectAtIndexedSubscript:0];
+          attachment.sampleBuffer = passCounterBuffer;
+          attachment.startOfEncoderSampleIndex = MTLCounterDontSample;
+          attachment.endOfEncoderSampleIndex = MTLCounterDontSample;
+          encoder = [commandBuffer computeCommandEncoderWithDescriptor:descriptor];
+        }
+      } else {
+        encoder = [commandBuffer computeCommandEncoder];
+      }
+      if (!encoder) {
+        impl_->lastError = "Unable to create Metal command encoder.";
+        return false;
+      }
+      encoder.label = @"SpektraFilm compute";
+      return true;
+    };
+    auto beginCommandEncoder = [&]() -> bool {
+      id<MTLCommandQueue> queue = externalMetal ? externalMetal->commandQueue : impl_->commandQueue;
+      commandBuffer = [queue commandBuffer];
+      if (!commandBuffer) {
+        impl_->lastError = "Unable to create Metal command buffer.";
+        return false;
+      }
+      commandBuffer.label = @"SpektraFilm render";
+      return beginComputeEncoder();
+    };
+    if (!beginCommandEncoder()) {
+      return false;
     }
     uint32_t dims[2] = {static_cast<uint32_t>(width), static_cast<uint32_t>(height)};
     const uint32_t grainBlurRecurrenceFlag = impl_->grainBlurRecurrence ? 1u : 0u;
     double splitCommandMs = 0.0;
 
-    auto recordPass = [&](id<MTLComputePipelineState> pipeline, uint32_t depth, NSUInteger tgWidth, NSUInteger tgHeight, uint64_t estimatedBytes) -> size_t {
+    auto recordPass = [&](
+      id<MTLComputePipelineState> pipeline,
+      uint32_t passWidth,
+      uint32_t passHeight,
+      uint32_t depth,
+      NSUInteger tgWidth,
+      NSUInteger tgHeight,
+      uint64_t estimatedBytes
+    ) -> size_t {
       MetalPassDiagnostics pass{};
       pass.name = impl_->pipelineName(pipeline);
-      pass.width = static_cast<uint32_t>(width);
-      pass.height = static_cast<uint32_t>(height);
+      pass.width = passWidth;
+      pass.height = passHeight;
       pass.depth = depth;
       pass.threadgroupWidth = static_cast<uint32_t>(tgWidth);
       pass.threadgroupHeight = static_cast<uint32_t>(tgHeight);
+      pass.threadExecutionWidth = pipeline ? static_cast<uint32_t>(pipeline.threadExecutionWidth) : 0u;
+      pass.maxTotalThreadsPerThreadgroup = pipeline ? static_cast<uint32_t>(pipeline.maxTotalThreadsPerThreadgroup) : 0u;
       pass.estimatedBytes = estimatedBytes;
       impl_->diagnostics.passes.push_back(pass);
       return impl_->diagnostics.passes.size() - 1u;
@@ -4135,7 +4372,9 @@ bool MetalRenderer::render(
       [commandBuffer commit];
       [commandBuffer waitUntilCompleted];
       const double passMs = elapsedMilliseconds(passStart, PerfClock::now());
+      const double passGpuMs = impl_->commandBufferGpuMilliseconds(commandBuffer);
       splitCommandMs += passMs;
+      impl_->diagnostics.gpuCommandBufferMs += passGpuMs;
       if ([commandBuffer status] == MTLCommandBufferStatusError) {
         NSError *error = [commandBuffer error];
         impl_->lastError = error ? [[error localizedDescription] UTF8String] : "Metal command buffer failed.";
@@ -4143,7 +4382,7 @@ bool MetalRenderer::render(
         return;
       }
       if (passIndex < impl_->diagnostics.passes.size()) {
-        impl_->diagnostics.passes[passIndex].gpuMs = passMs;
+        impl_->diagnostics.passes[passIndex].gpuMs = passGpuMs > 0.0 ? passGpuMs : passMs;
         impl_->diagnostics.passes[passIndex].gpuTimeAvailable = true;
       }
       if (!beginCommandEncoder()) {
@@ -4168,11 +4407,22 @@ bool MetalRenderer::render(
       }
       MTLSize threadsPerGroup = MTLSizeMake(tw, th, 1);
       MTLSize threads = MTLSizeMake(static_cast<NSUInteger>(width), static_cast<NSUInteger>(height), 1);
-      const size_t passIndex = recordPass(pipeline, 1u, threadsPerGroup.width, threadsPerGroup.height, estimatedBytes ? estimatedBytes : static_cast<uint64_t>(bufferBytes) * 2u);
+      const size_t passIndex = recordPass(
+        pipeline,
+        static_cast<uint32_t>(width),
+        static_cast<uint32_t>(height),
+        1u,
+        threadsPerGroup.width,
+        threadsPerGroup.height,
+        estimatedBytes ? estimatedBytes : static_cast<uint64_t>(bufferBytes) * 2u
+      );
       const NSUInteger startSample = static_cast<NSUInteger>(passIndex) * 2u;
       samplePassCounter(startSample);
       const auto splitPassStart = useSplitPassTiming ? PerfClock::now() : PerfClock::time_point{};
+      NSString *passLabel = [NSString stringWithUTF8String:impl_->diagnostics.passes[passIndex].name.c_str()];
+      [encoder pushDebugGroup:passLabel];
       [encoder dispatchThreads:threads threadsPerThreadgroup:threadsPerGroup];
+      [encoder popDebugGroup];
       samplePassCounter(startSample + 1u);
       impl_->diagnostics.passCount += 1u;
       finishSplitTimedPass(passIndex, splitPassStart);
@@ -4196,6 +4446,8 @@ bool MetalRenderer::render(
       MTLSize threads = MTLSizeMake(static_cast<NSUInteger>(dispatchWidth), static_cast<NSUInteger>(dispatchHeight), 1);
       const size_t passIndex = recordPass(
         pipeline,
+        dispatchWidth,
+        dispatchHeight,
         1u,
         threadsPerGroup.width,
         threadsPerGroup.height,
@@ -4204,7 +4456,10 @@ bool MetalRenderer::render(
       const NSUInteger startSample = static_cast<NSUInteger>(passIndex) * 2u;
       samplePassCounter(startSample);
       const auto splitPassStart = useSplitPassTiming ? PerfClock::now() : PerfClock::time_point{};
+      NSString *passLabel = [NSString stringWithUTF8String:impl_->diagnostics.passes[passIndex].name.c_str()];
+      [encoder pushDebugGroup:passLabel];
       [encoder dispatchThreads:threads threadsPerThreadgroup:threadsPerGroup];
+      [encoder popDebugGroup];
       samplePassCounter(startSample + 1u);
       impl_->diagnostics.passCount += 1u;
       finishSplitTimedPass(passIndex, splitPassStart);
@@ -4221,11 +4476,22 @@ bool MetalRenderer::render(
       MTLSize threadsPerGroup = MTLSizeMake(tgWidth, tgHeight, 1);
       MTLSize threads = MTLSizeMake(static_cast<NSUInteger>(width), static_cast<NSUInteger>(height), depth);
       const uint64_t defaultBytes = static_cast<uint64_t>(width) * static_cast<uint64_t>(height) * depth * sizeof(float) * 2u;
-      const size_t passIndex = recordPass(pipeline, depth, threadsPerGroup.width, threadsPerGroup.height, estimatedBytes ? estimatedBytes : defaultBytes);
+      const size_t passIndex = recordPass(
+        pipeline,
+        static_cast<uint32_t>(width),
+        static_cast<uint32_t>(height),
+        depth,
+        threadsPerGroup.width,
+        threadsPerGroup.height,
+        estimatedBytes ? estimatedBytes : defaultBytes
+      );
       const NSUInteger startSample = static_cast<NSUInteger>(passIndex) * 2u;
       samplePassCounter(startSample);
       const auto splitPassStart = useSplitPassTiming ? PerfClock::now() : PerfClock::time_point{};
+      NSString *passLabel = [NSString stringWithUTF8String:impl_->diagnostics.passes[passIndex].name.c_str()];
+      [encoder pushDebugGroup:passLabel];
       [encoder dispatchThreads:threads threadsPerThreadgroup:threadsPerGroup];
+      [encoder popDebugGroup];
       samplePassCounter(startSample + 1u);
       impl_->diagnostics.passCount += 1u;
       finishSplitTimedPass(passIndex, splitPassStart);
@@ -4240,11 +4506,22 @@ bool MetalRenderer::render(
       const NSUInteger tgWidth = std::min<NSUInteger>(std::max<NSUInteger>(pipeline.threadExecutionWidth, 1u), threadCount);
       MTLSize threadsPerGroup = MTLSizeMake(tgWidth, 1, 1);
       MTLSize threads = MTLSizeMake(threadCount, 1, 1);
-      const size_t passIndex = recordPass(pipeline, 1u, threadsPerGroup.width, threadsPerGroup.height, estimatedBytes);
+      const size_t passIndex = recordPass(
+        pipeline,
+        static_cast<uint32_t>(threadCount),
+        1u,
+        1u,
+        threadsPerGroup.width,
+        threadsPerGroup.height,
+        estimatedBytes
+      );
       const NSUInteger startSample = static_cast<NSUInteger>(passIndex) * 2u;
       samplePassCounter(startSample);
       const auto splitPassStart = useSplitPassTiming ? PerfClock::now() : PerfClock::time_point{};
+      NSString *passLabel = [NSString stringWithUTF8String:impl_->diagnostics.passes[passIndex].name.c_str()];
+      [encoder pushDebugGroup:passLabel];
       [encoder dispatchThreads:threads threadsPerThreadgroup:threadsPerGroup];
+      [encoder popDebugGroup];
       samplePassCounter(startSample + 1u);
       impl_->diagnostics.passCount += 1u;
       finishSplitTimedPass(passIndex, splitPassStart);
@@ -4278,7 +4555,9 @@ bool MetalRenderer::render(
         [commandBuffer commit];
         [commandBuffer waitUntilCompleted];
         const double passMs = elapsedMilliseconds(splitPassStart, PerfClock::now());
+        const double passGpuMs = impl_->commandBufferGpuMilliseconds(commandBuffer);
         splitCommandMs += passMs;
+        impl_->diagnostics.gpuCommandBufferMs += passGpuMs;
         if ([commandBuffer status] == MTLCommandBufferStatusError) {
           NSError *error = [commandBuffer error];
           impl_->lastError = error ? [[error localizedDescription] UTF8String] : "Metal command buffer failed.";
@@ -4286,7 +4565,7 @@ bool MetalRenderer::render(
           return;
         }
         if (passIndex < impl_->diagnostics.passes.size()) {
-          impl_->diagnostics.passes[passIndex].gpuMs = passMs;
+          impl_->diagnostics.passes[passIndex].gpuMs = passGpuMs > 0.0 ? passGpuMs : passMs;
           impl_->diagnostics.passes[passIndex].gpuTimeAvailable = true;
         }
         if (!beginCommandEncoder()) {
@@ -4337,6 +4616,23 @@ bool MetalRenderer::render(
       [encoder setBytes:dims length:sizeof(dims) atIndex:3];
       dispatch2D(impl_->enlargerResamplePipeline);
       renderSourceBuffer = enlargedSourceBuffer;
+    }
+
+    if (filteredEnlargerResponseBuffer) {
+      [encoder setComputePipelineState:impl_->filteredEnlargerResponsePipeline];
+      [encoder setBuffer:filteredEnlargerResponseBuffer offset:0 atIndex:0];
+      [encoder setBuffer:paramBuffer offset:0 atIndex:1];
+      [encoder setBuffer:spectralInfoBuffer offset:0 atIndex:2];
+      [encoder setBuffer:paperLogSensitivityBuffer offset:0 atIndex:3];
+      [encoder setBuffer:thKg3IlluminantBuffer offset:0 atIndex:4];
+      [encoder setBuffer:customEnlargerFiltersBuffer offset:0 atIndex:5];
+      [encoder setBuffer:neutralPrintFiltersBuffer offset:0 atIndex:6];
+      [encoder setBuffer:filmSpectralDensityBuffer offset:0 atIndex:7];
+      dispatch1D(
+        impl_->filteredEnlargerResponsePipeline,
+        filmCurves->wavelengthCount,
+        filteredEnlargerResponseBytes
+      );
     }
 
     if (needsFrameConstants) {
@@ -4410,6 +4706,7 @@ bool MetalRenderer::render(
     };
 
     auto encodeScannerPostProcess = [&](id<MTLBuffer> linearRgbBuffer) {
+      const uint32_t encodeOutput = impl_->linearFinalOutput ? 0u : 1u;
       linearRgbBuffer = encodePrintGlare(linearRgbBuffer);
       if (scannerTexturePath) {
         [encoder setComputePipelineState:impl_->bufferToTexturePipeline];
@@ -4499,6 +4796,7 @@ bool MetalRenderer::render(
         [encoder setBuffer:colorInfoBuffer offset:0 atIndex:3];
         [encoder setBuffer:colorTransferKindBuffer offset:0 atIndex:4];
         [encoder setBuffer:colorEncodeLutBuffer offset:0 atIndex:5];
+        [encoder setBytes:&encodeOutput length:sizeof(encodeOutput) atIndex:6];
         dispatch2D(impl_->scannerFinalizeTexturePipeline);
         return;
       }
@@ -4552,11 +4850,13 @@ bool MetalRenderer::render(
       [encoder setBuffer:colorInfoBuffer offset:0 atIndex:5];
       [encoder setBuffer:colorTransferKindBuffer offset:0 atIndex:6];
       [encoder setBuffer:colorEncodeLutBuffer offset:0 atIndex:7];
+      [encoder setBytes:&encodeOutput length:sizeof(encodeOutput) atIndex:8];
       dispatch2D(impl_->scannerFinalizePipeline);
     };
 
     auto encodeFinalFromFilmDensity = [&](id<MTLBuffer> filmDensityBuffer) {
-      const uint32_t encodeOutput = (directFinalEncodePath || !finalPostProcessPath) ? 1u : 0u;
+      const uint32_t encodeOutput =
+        !impl_->linearFinalOutput && (directFinalEncodePath || !finalPostProcessPath) ? 1u : 0u;
       [encoder setComputePipelineState:impl_->finalFromFilmDensityPipeline];
       [encoder setBuffer:filmDensityBuffer offset:0 atIndex:0];
       [encoder setBuffer:(directFinalEncodePath || !finalPostProcessPath ? dstBuffer : scannerRgbBufferA) offset:0 atIndex:1];
@@ -4577,14 +4877,14 @@ bool MetalRenderer::render(
       [encoder setBuffer:mallettBasisIlluminantBuffer offset:0 atIndex:16];
       [encoder setBuffer:inputToReferenceXyzBuffer offset:0 atIndex:17];
       [encoder setBuffer:filmChannelDensityBuffer offset:0 atIndex:18];
-      [encoder setBuffer:filmBaseDensityBuffer offset:0 atIndex:19];
-      [encoder setBuffer:paperLogSensitivityBuffer offset:0 atIndex:20];
+      [encoder setBuffer:filmSpectralDensityBuffer offset:0 atIndex:19];
+      [encoder setBuffer:(filteredEnlargerResponseBuffer ?: paperLogSensitivityBuffer) offset:0 atIndex:20];
       [encoder setBuffer:thKg3IlluminantBuffer offset:0 atIndex:21];
       [encoder setBuffer:customEnlargerFiltersBuffer offset:0 atIndex:22];
       [encoder setBuffer:neutralPrintFiltersBuffer offset:0 atIndex:23];
       [encoder setBuffer:academyPrinterDensityDataBuffer offset:0 atIndex:24];
-      [encoder setBuffer:paperScanDensityDataBuffer offset:0 atIndex:25];
-      [encoder setBuffer:scanIlluminantsAndCmfsBuffer offset:0 atIndex:26];
+      [encoder setBuffer:paperSpectralDensityBuffer offset:0 atIndex:25];
+      [encoder setBuffer:scanProductsBuffer offset:0 atIndex:26];
       [encoder setBuffer:scanToOutputRgbDataBuffer offset:0 atIndex:27];
       [encoder setBuffer:colorEncodeLutBuffer offset:0 atIndex:28];
       [encoder setBuffer:frameConstantsBuffer offset:0 atIndex:29];
@@ -4763,7 +5063,9 @@ bool MetalRenderer::render(
               [commandBuffer commit];
               [commandBuffer waitUntilCompleted];
               const double passMs = elapsedMilliseconds(splitPassStart, PerfClock::now());
+              const double passGpuMs = impl_->commandBufferGpuMilliseconds(commandBuffer);
               splitCommandMs += passMs;
+              impl_->diagnostics.gpuCommandBufferMs += passGpuMs;
               if ([commandBuffer status] == MTLCommandBufferStatusError) {
                 NSError *error = [commandBuffer error];
                 impl_->lastError = error ? [[error localizedDescription] UTF8String] : "Metal command buffer failed.";
@@ -4771,7 +5073,7 @@ bool MetalRenderer::render(
                 return;
               }
               if (passIndex < impl_->diagnostics.passes.size()) {
-                impl_->diagnostics.passes[passIndex].gpuMs = passMs;
+                impl_->diagnostics.passes[passIndex].gpuMs = passGpuMs > 0.0 ? passGpuMs : passMs;
                 impl_->diagnostics.passes[passIndex].gpuTimeAvailable = true;
               }
               if (!beginCommandEncoder()) {
@@ -5177,7 +5479,7 @@ bool MetalRenderer::render(
     };
 
     auto encodeFinalFromPrintRaw = [&](id<MTLBuffer> printRawBuffer) {
-      const uint32_t encodeOutput = directFinalEncodePath ? 1u : 0u;
+      const uint32_t encodeOutput = !impl_->linearFinalOutput && directFinalEncodePath ? 1u : 0u;
       [encoder setComputePipelineState:impl_->finalFromPrintRawPipeline];
       [encoder setBuffer:printRawBuffer offset:0 atIndex:0];
       [encoder setBuffer:(directFinalEncodePath || !finalPostProcessPath ? dstBuffer : scannerRgbBufferA) offset:0 atIndex:1];
@@ -5189,8 +5491,8 @@ bool MetalRenderer::render(
       [encoder setBuffer:spectralInfoBuffer offset:0 atIndex:7];
       [encoder setBuffer:colorInfoBuffer offset:0 atIndex:8];
       [encoder setBuffer:colorTransferKindBuffer offset:0 atIndex:9];
-      [encoder setBuffer:paperScanDensityDataBuffer offset:0 atIndex:10];
-      [encoder setBuffer:scanIlluminantsAndCmfsBuffer offset:0 atIndex:11];
+      [encoder setBuffer:paperSpectralDensityBuffer offset:0 atIndex:10];
+      [encoder setBuffer:scanProductsBuffer offset:0 atIndex:11];
       [encoder setBuffer:scanToOutputRgbDataBuffer offset:0 atIndex:12];
       [encoder setBuffer:colorEncodeLutBuffer offset:0 atIndex:13];
       [encoder setBuffer:curveInfoBuffer offset:0 atIndex:14];
@@ -5202,7 +5504,7 @@ bool MetalRenderer::render(
       [encoder setBuffer:mallettBasisIlluminantBuffer offset:0 atIndex:20];
       [encoder setBuffer:inputToReferenceXyzBuffer offset:0 atIndex:21];
       [encoder setBuffer:filmChannelDensityBuffer offset:0 atIndex:22];
-      [encoder setBuffer:filmBaseDensityBuffer offset:0 atIndex:23];
+      [encoder setBuffer:filmSpectralDensityBuffer offset:0 atIndex:23];
       [encoder setBuffer:paperLogSensitivityBuffer offset:0 atIndex:24];
       [encoder setBuffer:thKg3IlluminantBuffer offset:0 atIndex:25];
       [encoder setBuffer:customEnlargerFiltersBuffer offset:0 atIndex:26];
@@ -5233,8 +5535,8 @@ bool MetalRenderer::render(
       [encoder setBuffer:mallettBasisIlluminantBuffer offset:0 atIndex:12];
       [encoder setBuffer:inputToReferenceXyzBuffer offset:0 atIndex:13];
       [encoder setBuffer:filmChannelDensityBuffer offset:0 atIndex:14];
-      [encoder setBuffer:filmBaseDensityBuffer offset:0 atIndex:15];
-      [encoder setBuffer:paperLogSensitivityBuffer offset:0 atIndex:16];
+      [encoder setBuffer:filmSpectralDensityBuffer offset:0 atIndex:15];
+      [encoder setBuffer:filteredEnlargerResponseBuffer offset:0 atIndex:16];
       [encoder setBuffer:thKg3IlluminantBuffer offset:0 atIndex:17];
       [encoder setBuffer:customEnlargerFiltersBuffer offset:0 atIndex:18];
       [encoder setBuffer:neutralPrintFiltersBuffer offset:0 atIndex:19];
@@ -5254,6 +5556,42 @@ bool MetalRenderer::render(
       [encoder setBuffer:paperDensityCurvesBuffer offset:0 atIndex:6];
       [encoder setBuffer:spectralInfoBuffer offset:0 atIndex:7];
       dispatch2D(impl_->printDensityFromPrintRawPipeline);
+    };
+
+    auto encodeProfilePrintScanFromDensity = [&](id<MTLBuffer> printDensityBuffer, id<MTLBuffer> linearRgbBuffer) {
+      [encoder setComputePipelineState:impl_->profilePrintScanFromDensityPipeline];
+      [encoder setBuffer:printDensityBuffer offset:0 atIndex:0];
+      [encoder setBuffer:linearRgbBuffer offset:0 atIndex:1];
+      [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+      [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+      [encoder setBuffer:spectralInfoBuffer offset:0 atIndex:4];
+      [encoder setBuffer:colorInfoBuffer offset:0 atIndex:5];
+      [encoder setBuffer:paperSpectralDensityBuffer offset:0 atIndex:6];
+      [encoder setBuffer:scanProductsBuffer offset:0 atIndex:7];
+      [encoder setBuffer:scanToOutputRgbDataBuffer offset:0 atIndex:8];
+      [encoder setBuffer:frameConstantsBuffer offset:0 atIndex:9];
+      dispatch2D(impl_->profilePrintScanFromDensityPipeline);
+    };
+
+    auto encodeProfileFinalizeOutput = [&](id<MTLBuffer> linearRgbBuffer) {
+      const uint32_t encodeOutput = impl_->linearFinalOutput ? 0u : 1u;
+      [encoder setComputePipelineState:impl_->profileFinalizeOutputPipeline];
+      [encoder setBuffer:linearRgbBuffer offset:0 atIndex:0];
+      [encoder setBuffer:dstBuffer offset:0 atIndex:1];
+      [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+      [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+      [encoder setBuffer:colorInfoBuffer offset:0 atIndex:4];
+      [encoder setBuffer:colorTransferKindBuffer offset:0 atIndex:5];
+      [encoder setBuffer:colorEncodeLutBuffer offset:0 atIndex:6];
+      [encoder setBytes:&encodeOutput length:sizeof(encodeOutput) atIndex:7];
+      dispatch2D(impl_->profileFinalizeOutputPipeline);
+    };
+
+    auto encodeStagedFinalCore = [&](id<MTLBuffer> filmDensityBuffer) {
+      encodePrintRawFromFilmDensity(filmDensityBuffer, printRawBufferA);
+      encodePrintDensityFromPrintRaw(printRawBufferA, printRawBufferB);
+      encodeProfilePrintScanFromDensity(printRawBufferB, scannerRgbBufferA);
+      encodeProfileFinalizeOutput(scannerRgbBufferA);
     };
 
     auto encodePrintStageOutputFromRaw = [&](id<MTLBuffer> printRawBuffer) {
@@ -5292,6 +5630,8 @@ bool MetalRenderer::render(
       } else if (printStageOutput) {
         encodePrintRawFromFilmDensity(filmDensityBuffer, printRawBufferA);
         encodePrintStageOutputFromRaw(printRawBufferA);
+      } else if (stagedFinalCorePath) {
+        encodeStagedFinalCore(filmDensityBuffer);
       } else {
         encodeFinalFromFilmDensity(filmDensityBuffer);
       }
@@ -5751,6 +6091,7 @@ bool MetalRenderer::render(
       impl_->diagnostics.commandBufferMs = splitCommandMs;
     } else {
       const auto commandStart = PerfClock::now();
+      impl_->diagnostics.commandEncodingMs = elapsedMilliseconds(commandEncodingStart, commandStart);
       impl_->diagnostics.cpuSetupMs = std::max(0.0, elapsedMilliseconds(renderStart, commandStart) - impl_->diagnostics.sourceCopyMs);
       [encoder endEncoding];
       if (externalMetal) {
@@ -5762,6 +6103,7 @@ bool MetalRenderer::render(
       } else {
         [commandBuffer waitUntilCompleted];
         impl_->diagnostics.commandBufferMs = elapsedMilliseconds(commandStart, PerfClock::now());
+        impl_->diagnostics.gpuCommandBufferMs = impl_->commandBufferGpuMilliseconds(commandBuffer);
 
         if ([commandBuffer status] == MTLCommandBufferStatusError) {
           NSError *error = [commandBuffer error];

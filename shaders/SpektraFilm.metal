@@ -3,6 +3,10 @@ using namespace metal;
 
 constant int kSpektraOutputRoleDisplayHdr = 1;
 constant int kSpektraOutputRoleSceneHandoff = 2;
+constant uint kSpektraColorAdaptationInputCompression = 1u << 0u;
+constant uint kSpektraColorAdaptationCurveSmoothing = 1u << 1u;
+constant uint kSpektraColorAdaptationOutputLightnessCompression = 1u << 2u;
+constant uint kSpektraColorAdaptationOutputChromaCompression = 1u << 3u;
 
 struct SpektraKernelParams {
   int process;
@@ -16,7 +20,7 @@ struct SpektraKernelParams {
   float hdrPeakNits;
   float hdrExposureEv;
   int hdrToneMapping;
-  uint colorAdaptationEnabled;
+  uint colorAdaptationFlags;
   int film;
   int paper;
   int printTiming;
@@ -155,6 +159,10 @@ struct SpektraKernelParams {
   uint _padPerf0;
   float time;
 };
+
+static bool spektra_color_adaptation_enabled(constant SpektraKernelParams &params, uint flag) {
+  return (params.colorAdaptationFlags & flag) != 0u;
+}
 
 constant uint kSpektraGrainSynthesisMaxSamples = 1024u;
 
@@ -722,7 +730,9 @@ static float3 spektra_output_gamut_compress_oklch(
   device const float *outputGamutCompressionData,
   float lowerBound,
   float upperBound,
-  bool softenInGamut
+  bool softenInGamut,
+  bool compressLightness,
+  bool compressChroma
 ) {
   if (outputGamutCompressionData == nullptr) {
     return rgb;
@@ -736,9 +746,11 @@ static float3 spektra_output_gamut_compress_oklch(
   }
   const uint dataOffset = colorSpace * kSpektraOutputGamutCompressionStride;
   float3 lab = spektra_oklab_from_output_rgb(rgb, outputGamutCompressionData, dataOffset);
-  lab.x = softenInGamut
-    ? spektra_reinhard_knee(max(lab.x, 0.0), 0.7, 1.0, 2.2)
-    : clamp(lab.x, 0.0, pow(max(upperBound, 0.0), 1.0 / 3.0));
+  if (compressLightness) {
+    lab.x = softenInGamut
+      ? spektra_reinhard_knee(max(lab.x, 0.0), 0.7, 1.0, 2.2)
+      : clamp(lab.x, 0.0, pow(max(upperBound, 0.0), 1.0 / 3.0));
+  }
   const float chroma = length(lab.yz);
   if (!(chroma > 1.0e-10) || !isfinite(chroma)) {
     if (inBounds) {
@@ -746,6 +758,12 @@ static float3 spektra_output_gamut_compress_oklch(
     }
     const float3 neutral = spektra_output_rgb_from_oklab(float3(lab.x, 0.0, 0.0), outputGamutCompressionData, dataOffset);
     return clamp(neutral, float3(lowerBound), float3(upperBound));
+  }
+  if (!compressChroma) {
+    const float3 lightnessCompressed = spektra_output_rgb_from_oklab(lab, outputGamutCompressionData, dataOffset);
+    return spektra_rgb_in_bounds(lightnessCompressed, lowerBound, upperBound)
+      ? lightnessCompressed
+      : clamp(lightnessCompressed, float3(lowerBound), float3(upperBound));
   }
   const float2 hueUnit = lab.yz / chroma;
   const float cmax = max(
@@ -777,10 +795,23 @@ static float3 spektra_finalize_display_hdr_rgb(
   device const float *outputGamutCompressionData =
     encodeLuts + colorInfo.colorSpaceCount * colorInfo.transferLutSize;
   const uint colorSpace = spektra_final_output_color_space(params, colorInfo);
-  const bool compressOutputGamut = params.colorAdaptationEnabled != 0u;
+  const bool compressLightness =
+    spektra_color_adaptation_enabled(params, kSpektraColorAdaptationOutputLightnessCompression);
+  const bool compressChroma =
+    spektra_color_adaptation_enabled(params, kSpektraColorAdaptationOutputChromaCompression);
+  const bool compressOutputGamut = compressLightness || compressChroma;
   float3 nits = spektra_hdr_apply_luminance_tone_map(compressOutputGamut ? rgb : max(rgb, float3(0.0)), params);
   if (compressOutputGamut) {
-    nits = spektra_output_gamut_compress_oklch(nits / peak, colorSpace, outputGamutCompressionData, 0.0, 1.0, false) * peak;
+    nits = spektra_output_gamut_compress_oklch(
+      nits / peak,
+      colorSpace,
+      outputGamutCompressionData,
+      0.0,
+      1.0,
+      false,
+      compressLightness,
+      compressChroma
+    ) * peak;
     nits = clamp(nits, float3(0.0), float3(peak));
   } else {
     nits = max(nits, float3(0.0));
@@ -805,9 +836,22 @@ static float3 spektra_finalize_display_sdr_rgb(
     encodeLuts + colorInfo.colorSpaceCount * colorInfo.transferLutSize;
   device const float *transferParams =
     encodeLuts + colorInfo.colorSpaceCount * (colorInfo.transferLutSize + kSpektraOutputGamutCompressionStride);
-  if (params.colorAdaptationEnabled != 0u) {
+  const bool compressLightness =
+    spektra_color_adaptation_enabled(params, kSpektraColorAdaptationOutputLightnessCompression);
+  const bool compressChroma =
+    spektra_color_adaptation_enabled(params, kSpektraColorAdaptationOutputChromaCompression);
+  if (compressLightness || compressChroma) {
     const uint colorSpace = spektra_final_output_color_space(params, colorInfo);
-    rgb = spektra_output_gamut_compress_oklch(rgb, colorSpace, outputGamutCompressionData, 0.0, 1.0, true);
+    rgb = spektra_output_gamut_compress_oklch(
+      rgb,
+      colorSpace,
+      outputGamutCompressionData,
+      0.0,
+      1.0,
+      true,
+      compressLightness,
+      compressChroma
+    );
   }
   return spektra_encode_output_rgb(rgb, params, colorInfo, encodeLuts, transferKinds, transferParams);
 }
@@ -1403,7 +1447,7 @@ static float3 spektra_film_raw_from_decoded(
     raw = spektra_mallett_raw(srgb, mallettBasisIlluminant);
   } else {
     const float3 xyz = spektra_mul_color_matrix(decoded, params.inputColorSpace, colorInfo, inputToReferenceXyz);
-    const uint compressedOffset = params.colorAdaptationEnabled != 0u
+    const uint compressedOffset = spektra_color_adaptation_enabled(params, kSpektraColorAdaptationInputCompression)
       ? info.hanatosWidth * info.hanatosHeight * 3u
       : 0u;
     raw = spektra_hanatos_raw(xyz, info, hanatosSpectraLut + compressedOffset);
@@ -1503,12 +1547,14 @@ static float3 spektra_develop_film_density(
   device const float *logExposure,
   device const float *densityCurves
 ) {
+  const uint smoothInterpolation =
+    spektra_color_adaptation_enabled(params, kSpektraColorAdaptationCurveSmoothing) ? 1u : 0u;
   if (params.filmPushPullMode == 1) {
     const float3 lookupRaw = spektra_experimental_push_pull_log_raw(logRaw, params.filmPushPullStops);
     const float3 density = float3(
-      spektra_interp_density_curve(lookupRaw.r, 0u, params.filmGamma, curveInfo, logExposure, densityCurves, params.densityCurveLookupMode, params.colorAdaptationEnabled),
-      spektra_interp_density_curve(lookupRaw.g, 1u, params.filmGamma, curveInfo, logExposure, densityCurves, params.densityCurveLookupMode, params.colorAdaptationEnabled),
-      spektra_interp_density_curve(lookupRaw.b, 2u, params.filmGamma, curveInfo, logExposure, densityCurves, params.densityCurveLookupMode, params.colorAdaptationEnabled)
+      spektra_interp_density_curve(lookupRaw.r, 0u, params.filmGamma, curveInfo, logExposure, densityCurves, params.densityCurveLookupMode, smoothInterpolation),
+      spektra_interp_density_curve(lookupRaw.g, 1u, params.filmGamma, curveInfo, logExposure, densityCurves, params.densityCurveLookupMode, smoothInterpolation),
+      spektra_interp_density_curve(lookupRaw.b, 2u, params.filmGamma, curveInfo, logExposure, densityCurves, params.densityCurveLookupMode, smoothInterpolation)
     );
     return density * float3(
       spektra_experimental_push_pull_density_gain(lookupRaw.r, 0u, params.filmPushPullStops),
@@ -1517,9 +1563,9 @@ static float3 spektra_develop_film_density(
     );
   }
   return float3(
-    spektra_interp_density_curve(logRaw.r, 0u, params.filmGamma, curveInfo, logExposure, densityCurves, params.densityCurveLookupMode, params.colorAdaptationEnabled),
-    spektra_interp_density_curve(logRaw.g, 1u, params.filmGamma, curveInfo, logExposure, densityCurves, params.densityCurveLookupMode, params.colorAdaptationEnabled),
-    spektra_interp_density_curve(logRaw.b, 2u, params.filmGamma, curveInfo, logExposure, densityCurves, params.densityCurveLookupMode, params.colorAdaptationEnabled)
+    spektra_interp_density_curve(logRaw.r, 0u, params.filmGamma, curveInfo, logExposure, densityCurves, params.densityCurveLookupMode, smoothInterpolation),
+    spektra_interp_density_curve(logRaw.g, 1u, params.filmGamma, curveInfo, logExposure, densityCurves, params.densityCurveLookupMode, smoothInterpolation),
+    spektra_interp_density_curve(logRaw.b, 2u, params.filmGamma, curveInfo, logExposure, densityCurves, params.densityCurveLookupMode, smoothInterpolation)
   );
 }
 
@@ -1588,6 +1634,11 @@ static float spektra_spectral_transmittance(float density, constant SpektraKerne
     return fast::exp(-density * kLnTen);
   }
   return pow(10.0, -density);
+}
+
+static float spektra_spectral_transmittance_pow(float density) {
+  const float transmittance = pow(10.0, -density);
+  return isfinite(transmittance) ? transmittance : 0.0;
 }
 
 static float spektra_preflash_filtered_enlarger_illuminant(
@@ -1764,6 +1815,81 @@ static float3 spektra_print_raw_from_film_density(
       spektra_filtered_enlarger_illuminant(wavelength, params, info, thKg3Illuminant, customEnlargerFilters, neutralPrintFilters);
     const float light = isfinite(lightRaw) ? lightRaw : 0.0;
     raw += light * spektra_sensitivity(wavelength, paperLogSensitivity);
+  }
+  return raw;
+}
+
+static float3 spektra_print_raw_from_film_density_cached(
+  float3 filmDensityCmy,
+  constant SpektraKernelParams &params,
+  constant SpektraSpectralInfo &info,
+  device const float *filmChannelDensity,
+  device const float4 *filmSpectralDensity,
+  device const float4 *filteredEnlargerResponse,
+  device const float *academyPrinterDensityData
+) {
+  if (params.printTiming != 1 &&
+      params.spectralTransmittanceMode == 0u &&
+      params.negativeBleachBypassAmount == 0.0 &&
+      info.filmWavelengthCount == 81u) {
+    float3 raw0 = float3(0.0);
+    float3 raw1 = float3(0.0);
+    float3 raw2 = float3(0.0);
+    for (uint wavelength = 0u; wavelength < 81u; wavelength += 3u) {
+      const float4 spectral0 = filmSpectralDensity[wavelength];
+      const float4 spectral1 = filmSpectralDensity[wavelength + 1u];
+      const float4 spectral2 = filmSpectralDensity[wavelength + 2u];
+      raw0 += spektra_spectral_transmittance_pow(dot(filmDensityCmy, spectral0.xyz)) *
+        filteredEnlargerResponse[wavelength].xyz;
+      raw1 += spektra_spectral_transmittance_pow(dot(filmDensityCmy, spectral1.xyz)) *
+        filteredEnlargerResponse[wavelength + 1u].xyz;
+      raw2 += spektra_spectral_transmittance_pow(dot(filmDensityCmy, spectral2.xyz)) *
+        filteredEnlargerResponse[wavelength + 2u].xyz;
+    }
+    return raw0 + raw1 + raw2;
+  }
+  float3 raw = float3(0.0);
+  const float3 bypassedFilmDensityCmy = spektra_negative_bleach_bypass_dye_density(
+    filmDensityCmy,
+    params.negativeBleachBypassAmount,
+    params,
+    info
+  );
+  const float retainedSilverDensity = spektra_bleach_bypass_retained_silver_density(
+    filmDensityCmy,
+    params.negativeBleachBypassAmount,
+    false,
+    info
+  );
+  if (params.printTiming == 1) {
+    float3 normalization = float3(0.0);
+    for (uint wavelength = 0u; wavelength < info.filmWavelengthCount; ++wavelength) {
+      const uint channelOffset = wavelength * 3u;
+      const float4 spectral = filmSpectralDensity[wavelength];
+      const float densitySpectral =
+        dot(bypassedFilmDensityCmy, spectral.xyz) +
+        spectral.w +
+        spektra_bleach_bypass_silver_spectral_density(retainedSilverDensity);
+      const float transmittance = spektra_spectral_transmittance(densitySpectral, params);
+      const float3 apd = max(float3(
+        academyPrinterDensityData[channelOffset],
+        academyPrinterDensityData[channelOffset + 1u],
+        academyPrinterDensityData[channelOffset + 2u]
+      ), float3(0.0));
+      raw += (isfinite(transmittance) ? transmittance : 0.0) * apd;
+      normalization += apd;
+    }
+    return raw / max(normalization, float3(1.0e-10));
+  }
+  for (uint wavelength = 0u; wavelength < info.filmWavelengthCount; ++wavelength) {
+    const float4 spectral = filmSpectralDensity[wavelength];
+    const float densitySpectral =
+      dot(bypassedFilmDensityCmy, spectral.xyz) +
+      spectral.w +
+      spektra_bleach_bypass_silver_spectral_density(retainedSilverDensity);
+    const float transmittance = spektra_spectral_transmittance(densitySpectral, params);
+    const float3 response = filteredEnlargerResponse[info.filmWavelengthCount + wavelength].xyz;
+    raw += (isfinite(transmittance) ? transmittance : 0.0) * response;
   }
   return raw;
 }
@@ -1958,6 +2084,31 @@ static float3 spektra_print_log_raw_with_preflash_and_exposure_factor(
   return log10(max(rawTimed * exp2(params.printExposureEv), float3(0.0)) + float3(1.0e-10));
 }
 
+static float3 spektra_print_log_raw_with_cached_response(
+  float3 filmDensityCmy,
+  constant SpektraKernelParams &params,
+  constant SpektraSpectralInfo &info,
+  device const float *filmChannelDensity,
+  device const float4 *filmSpectralDensity,
+  device const float4 *filteredEnlargerResponse,
+  device const float *academyPrinterDensityData,
+  float exposureFactor,
+  float3 rawPreflash
+) {
+  const float3 raw = spektra_print_raw_from_film_density_cached(
+    filmDensityCmy,
+    params,
+    info,
+    filmChannelDensity,
+    filmSpectralDensity,
+    filteredEnlargerResponse,
+    academyPrinterDensityData
+  );
+  const float3 rawTimed = raw * spektra_apd_printer_timing_exposure_scale(params, info, academyPrinterDensityData) *
+    exposureFactor + rawPreflash;
+  return log10(max(rawTimed * exp2(params.printExposureEv), float3(0.0)) + float3(1.0e-10));
+}
+
 static float3 spektra_print_log_raw_with_exposure_factor(
   float3 filmDensityCmy,
   constant SpektraKernelParams &params,
@@ -2061,10 +2212,12 @@ static float3 spektra_develop_print_density(
   device const float *paperLogExposure,
   device const float *paperDensityCurves
 ) {
+  const uint smoothInterpolation =
+    spektra_color_adaptation_enabled(params, kSpektraColorAdaptationCurveSmoothing) ? 1u : 0u;
   const float3 density = float3(
-    spektra_interp_density_curve(logRaw.r, 0u, params.printGamma, paperCurveInfo, paperLogExposure, paperDensityCurves, params.densityCurveLookupMode, params.colorAdaptationEnabled),
-    spektra_interp_density_curve(logRaw.g, 1u, params.printGamma, paperCurveInfo, paperLogExposure, paperDensityCurves, params.densityCurveLookupMode, params.colorAdaptationEnabled),
-    spektra_interp_density_curve(logRaw.b, 2u, params.printGamma, paperCurveInfo, paperLogExposure, paperDensityCurves, params.densityCurveLookupMode, params.colorAdaptationEnabled)
+    spektra_interp_density_curve(logRaw.r, 0u, params.printGamma, paperCurveInfo, paperLogExposure, paperDensityCurves, params.densityCurveLookupMode, smoothInterpolation),
+    spektra_interp_density_curve(logRaw.g, 1u, params.printGamma, paperCurveInfo, paperLogExposure, paperDensityCurves, params.densityCurveLookupMode, smoothInterpolation),
+    spektra_interp_density_curve(logRaw.b, 2u, params.printGamma, paperCurveInfo, paperLogExposure, paperDensityCurves, params.densityCurveLookupMode, smoothInterpolation)
   );
   if (params.printShadowShape == 0.0 && params.printHighlightShape == 0.0) {
     return density;
@@ -2126,6 +2279,117 @@ static SpektraScanResult spektra_scan_density_to_output_rgb_linear_y(
   }
   xyz /= max(normalization, 1.0e-10);
   return {spektra_mul_color_matrix(xyz, int(spektra_final_output_color_space(params, colorInfo)), colorInfo, scanToOutputRgb), xyz.y};
+}
+
+static SpektraScanResult spektra_scan_density_to_output_rgb_linear_y_cached(
+  float3 densityCmy,
+  float retainedSilverDensity,
+  constant SpektraKernelParams &params,
+  constant SpektraColorInfo &colorInfo,
+  constant SpektraSpectralInfo &info,
+  device const float4 *spectralDensity,
+  device const float *scanCmfProducts,
+  float inverseNormalization,
+  device const float *scanToOutputRgb
+) {
+  float3 xyz0 = float3(0.0);
+  float3 xyz1 = float3(0.0);
+  float3 xyz2 = float3(0.0);
+  uint wavelength = 0u;
+  for (; wavelength + 2u < info.filmWavelengthCount; wavelength += 3u) {
+    const uint offset0 = wavelength * 3u;
+    const uint offset1 = offset0 + 3u;
+    const uint offset2 = offset0 + 6u;
+    const float4 spectral0 = spectralDensity[wavelength];
+    const float4 spectral1 = spectralDensity[wavelength + 1u];
+    const float4 spectral2 = spectralDensity[wavelength + 2u];
+    const float density0 = dot(densityCmy, spectral0.xyz) + spectral0.w + retainedSilverDensity;
+    const float density1 = dot(densityCmy, spectral1.xyz) + spectral1.w + retainedSilverDensity;
+    const float density2 = dot(densityCmy, spectral2.xyz) + spectral2.w + retainedSilverDensity;
+    const float transmittance0 = spektra_spectral_transmittance(density0, params);
+    const float transmittance1 = spektra_spectral_transmittance(density1, params);
+    const float transmittance2 = spektra_spectral_transmittance(density2, params);
+    xyz0 += (isfinite(transmittance0) ? transmittance0 : 0.0) * float3(
+      scanCmfProducts[offset0],
+      scanCmfProducts[offset0 + 1u],
+      scanCmfProducts[offset0 + 2u]
+    );
+    xyz1 += (isfinite(transmittance1) ? transmittance1 : 0.0) * float3(
+      scanCmfProducts[offset1],
+      scanCmfProducts[offset1 + 1u],
+      scanCmfProducts[offset1 + 2u]
+    );
+    xyz2 += (isfinite(transmittance2) ? transmittance2 : 0.0) * float3(
+      scanCmfProducts[offset2],
+      scanCmfProducts[offset2 + 1u],
+      scanCmfProducts[offset2 + 2u]
+    );
+  }
+  float3 xyz = xyz0 + xyz1 + xyz2;
+  for (; wavelength < info.filmWavelengthCount; ++wavelength) {
+    const uint offset = wavelength * 3u;
+    const float4 spectral = spectralDensity[wavelength];
+    const float density = dot(densityCmy, spectral.xyz) + spectral.w + retainedSilverDensity;
+    const float transmittance = spektra_spectral_transmittance(density, params);
+    xyz += (isfinite(transmittance) ? transmittance : 0.0) * float3(
+      scanCmfProducts[offset],
+      scanCmfProducts[offset + 1u],
+      scanCmfProducts[offset + 2u]
+    );
+  }
+  xyz *= inverseNormalization;
+  return {spektra_mul_color_matrix(xyz, int(spektra_final_output_color_space(params, colorInfo)), colorInfo, scanToOutputRgb), xyz.y};
+}
+
+static SpektraScanResult spektra_scan_density_to_output_rgb_linear_y_cached_common(
+  float3 densityCmy,
+  bool printStage,
+  constant SpektraKernelParams &params,
+  constant SpektraColorInfo &colorInfo,
+  constant SpektraSpectralInfo &info,
+  device const float4 *spectralDensity,
+  device const float4 *packedScanCmfProducts,
+  device const float *legacyScanCmfProducts,
+  float inverseNormalization,
+  device const float *scanToOutputRgb
+) {
+  const float bleachBypassAmount = printStage
+    ? params.printBleachBypassAmount
+    : params.negativeBleachBypassAmount;
+  if (bleachBypassAmount == 0.0 &&
+      params.spectralTransmittanceMode == 0u &&
+      info.filmWavelengthCount == 81u) {
+    float3 xyz0 = float3(0.0);
+    float3 xyz1 = float3(0.0);
+    float3 xyz2 = float3(0.0);
+    for (uint wavelength = 0u; wavelength < 81u; wavelength += 3u) {
+      const float4 spectral0 = spectralDensity[wavelength];
+      const float4 spectral1 = spectralDensity[wavelength + 1u];
+      const float4 spectral2 = spectralDensity[wavelength + 2u];
+      xyz0 += spektra_spectral_transmittance_pow(dot(densityCmy, spectral0.xyz)) *
+        packedScanCmfProducts[wavelength].xyz;
+      xyz1 += spektra_spectral_transmittance_pow(dot(densityCmy, spectral1.xyz)) *
+        packedScanCmfProducts[wavelength + 1u].xyz;
+      xyz2 += spektra_spectral_transmittance_pow(dot(densityCmy, spectral2.xyz)) *
+        packedScanCmfProducts[wavelength + 2u].xyz;
+    }
+    const float3 xyz = (xyz0 + xyz1 + xyz2) * inverseNormalization;
+    return {spektra_mul_color_matrix(xyz, int(spektra_final_output_color_space(params, colorInfo)), colorInfo, scanToOutputRgb), xyz.y};
+  }
+  const float3 bypassedDensityCmy = printStage
+    ? spektra_bleach_bypass_dye_density(densityCmy, bleachBypassAmount, true, info)
+    : spektra_negative_bleach_bypass_dye_density(densityCmy, bleachBypassAmount, params, info);
+  return spektra_scan_density_to_output_rgb_linear_y_cached(
+    bypassedDensityCmy,
+    spektra_bleach_bypass_retained_silver_density(densityCmy, bleachBypassAmount, printStage, info),
+    params,
+    colorInfo,
+    info,
+    spectralDensity,
+    legacyScanCmfProducts,
+    inverseNormalization,
+    scanToOutputRgb
+  );
 }
 
 static float3 spektra_scan_density_to_output_rgb_linear(
@@ -2378,6 +2642,35 @@ static float spektra_print_reference_y(
     standardObserverCmfs,
     paperScanToOutputRgb
   );
+}
+
+kernel void spektrafilm_filtered_enlarger_response(
+  device float4 *responseOut [[buffer(0)]],
+  constant SpektraKernelParams &params [[buffer(1)]],
+  constant SpektraSpectralInfo &spectralInfo [[buffer(2)]],
+  device const float *paperLogSensitivity [[buffer(3)]],
+  device const float *thKg3Illuminant [[buffer(4)]],
+  device const float *customEnlargerFilters [[buffer(5)]],
+  device const float *neutralPrintFilters [[buffer(6)]],
+  device const float4 *filmSpectralDensity [[buffer(7)]],
+  uint tid [[thread_position_in_grid]]
+) {
+  if (tid >= spectralInfo.filmWavelengthCount) {
+    return;
+  }
+  const float illuminant = spektra_filtered_enlarger_illuminant(
+    tid,
+    params,
+    spectralInfo,
+    thKg3Illuminant,
+    customEnlargerFilters,
+    neutralPrintFilters
+  );
+  const float baseTransmittanceRaw = spektra_spectral_transmittance(filmSpectralDensity[tid].w, params);
+  const float baseTransmittance = isfinite(baseTransmittanceRaw) ? baseTransmittanceRaw : 0.0;
+  const float3 response = illuminant * spektra_sensitivity(tid, paperLogSensitivity);
+  responseOut[tid] = float4(baseTransmittance * response, 0.0);
+  responseOut[spectralInfo.filmWavelengthCount + tid] = float4(response, 0.0);
 }
 
 kernel void spektrafilm_frame_constants(
@@ -6428,14 +6721,14 @@ kernel void spektrafilm_final_from_film_density(
   device const float *mallettBasisIlluminant [[buffer(16)]],
   device const float *inputToReferenceXyz [[buffer(17)]],
   device const float *filmChannelDensity [[buffer(18)]],
-  device const float *filmBaseDensity [[buffer(19)]],
-  device const float *paperLogSensitivity [[buffer(20)]],
+  device const float4 *filmSpectralDensity [[buffer(19)]],
+  device const float4 *filteredEnlargerResponse [[buffer(20)]],
   device const float *thKg3Illuminant [[buffer(21)]],
   device const float *customEnlargerFilters [[buffer(22)]],
   device const float *neutralPrintFilters [[buffer(23)]],
   device const float *academyPrinterDensityData [[buffer(24)]],
-  device const float *paperScanDensityData [[buffer(25)]],
-  device const float *scanIlluminantsAndCmfs [[buffer(26)]],
+  device const float4 *paperSpectralDensity [[buffer(25)]],
+  device const float *scanProducts [[buffer(26)]],
   device const float *scanToOutputRgbData [[buffer(27)]],
   device const float *encodeLuts [[buffer(28)]],
   constant SpektraFrameConstants &frameConstants [[buffer(29)]],
@@ -6447,11 +6740,13 @@ kernel void spektrafilm_final_from_film_density(
   }
   const uint index = gid.y * dims.x + gid.x;
   float4 pixel = filmDensity[index];
-  device const float *paperChannelDensity = paperScanDensityData;
-  device const float *paperBaseDensity = paperScanDensityData + spectralInfo.filmWavelengthCount * 3u;
-  device const float *filmScanIlluminant = scanIlluminantsAndCmfs;
-  device const float *paperScanIlluminant = scanIlluminantsAndCmfs + spectralInfo.filmWavelengthCount;
-  device const float *standardObserverCmfs = scanIlluminantsAndCmfs + spectralInfo.filmWavelengthCount * 2u;
+  device const float4 *packedScanProducts = (device const float4 *)scanProducts;
+  device const float4 *filmPackedScanProducts = packedScanProducts;
+  device const float4 *paperPackedScanProducts = packedScanProducts + spectralInfo.filmWavelengthCount;
+  device const float *legacyScanProducts = scanProducts + spectralInfo.filmWavelengthCount * 8u;
+  device const float *filmLegacyScanProducts = legacyScanProducts;
+  device const float *paperLegacyScanProducts = legacyScanProducts + spectralInfo.filmWavelengthCount * 3u;
+  device const float *scanInverseNormalizations = legacyScanProducts + spectralInfo.filmWavelengthCount * 6u;
   device const float *filmScanToOutputRgb = scanToOutputRgbData;
   device const float *paperScanToOutputRgb = scanToOutputRgbData + colorInfo.colorSpaceCount * 9u;
 
@@ -6459,16 +6754,13 @@ kernel void spektrafilm_final_from_film_density(
   const bool finalPrintSimulation = params.process == 0 && !sceneHandoffOutput;
   const bool finalScanNegative = params.process == 1 || sceneHandoffOutput;
   if (finalPrintSimulation) {
-    pixel.rgb = spektra_print_log_raw_with_preflash_and_exposure_factor(
+    pixel.rgb = spektra_print_log_raw_with_cached_response(
         pixel.rgb,
         params,
         spectralInfo,
         filmChannelDensity,
-        filmBaseDensity,
-        paperLogSensitivity,
-        thKg3Illuminant,
-        customEnlargerFilters,
-        neutralPrintFilters,
+        filmSpectralDensity,
+        filteredEnlargerResponse,
         academyPrinterDensityData,
         frameConstants.print.x,
         frameConstants.preflash.rgb
@@ -6486,45 +6778,31 @@ kernel void spektrafilm_final_from_film_density(
   }
   if (finalPrintSimulation) {
     const float3 printDensityCmy = pixel.rgb;
-    const float3 bypassedPrintDensityCmy = spektra_bleach_bypass_dye_density(
+    SpektraScanResult scan = spektra_scan_density_to_output_rgb_linear_y_cached_common(
       printDensityCmy,
-      params.printBleachBypassAmount,
-      true,
-      spectralInfo
-    );
-    SpektraScanResult scan = spektra_scan_density_to_output_rgb_linear_y(
-      bypassedPrintDensityCmy,
-      spektra_bleach_bypass_retained_silver_density(printDensityCmy, params.printBleachBypassAmount, true, spectralInfo),
       true,
       params,
       colorInfo,
       spectralInfo,
-      paperChannelDensity,
-      paperBaseDensity,
-      paperScanIlluminant,
-      standardObserverCmfs,
+      paperSpectralDensity,
+      paperPackedScanProducts,
+      paperLegacyScanProducts,
+      scanInverseNormalizations[1],
       paperScanToOutputRgb
     );
     pixel.rgb = spektra_apply_print_scan_output_contract(scan, frameConstants, params);
   } else if (finalScanNegative) {
     const float3 filmDensityCmy = pixel.rgb;
-    const float3 bypassedFilmDensityCmy = spektra_negative_bleach_bypass_dye_density(
+    SpektraScanResult scan = spektra_scan_density_to_output_rgb_linear_y_cached_common(
       filmDensityCmy,
-      params.negativeBleachBypassAmount,
-      params,
-      spectralInfo
-    );
-    SpektraScanResult scan = spektra_scan_density_to_output_rgb_linear_y(
-      bypassedFilmDensityCmy,
-      spektra_bleach_bypass_retained_silver_density(filmDensityCmy, params.negativeBleachBypassAmount, false, spectralInfo),
       false,
       params,
       colorInfo,
       spectralInfo,
-      filmChannelDensity,
-      filmBaseDensity,
-      filmScanIlluminant,
-      standardObserverCmfs,
+      filmSpectralDensity,
+      filmPackedScanProducts,
+      filmLegacyScanProducts,
+      scanInverseNormalizations[0],
       filmScanToOutputRgb
     );
     pixel.rgb = spektra_apply_film_scan_output_contract(scan, frameConstants, params, spectralInfo);
@@ -6551,8 +6829,8 @@ kernel void spektrafilm_print_raw_from_film_density(
   device const float *mallettBasisIlluminant [[buffer(12)]],
   device const float *inputToReferenceXyz [[buffer(13)]],
   device const float *filmChannelDensity [[buffer(14)]],
-  device const float *filmBaseDensity [[buffer(15)]],
-  device const float *paperLogSensitivity [[buffer(16)]],
+  device const float4 *filmSpectralDensity [[buffer(15)]],
+  device const float4 *filteredEnlargerResponse [[buffer(16)]],
   device const float *thKg3Illuminant [[buffer(17)]],
   device const float *customEnlargerFilters [[buffer(18)]],
   device const float *neutralPrintFilters [[buffer(19)]],
@@ -6565,16 +6843,13 @@ kernel void spektrafilm_print_raw_from_film_density(
   }
   const uint index = gid.y * dims.x + gid.x;
   const float4 density = filmDensity[index];
-  const float3 raw = spektra_print_raw_from_film_density(
+  const float3 raw = spektra_print_raw_from_film_density_cached(
     density.rgb,
     params,
     spectralInfo,
     filmChannelDensity,
-    filmBaseDensity,
-    paperLogSensitivity,
-    thKg3Illuminant,
-    customEnlargerFilters,
-    neutralPrintFilters,
+    filmSpectralDensity,
+    filteredEnlargerResponse,
     academyPrinterDensityData
   );
   const float3 rawTimed = raw * spektra_apd_printer_timing_exposure_scale(params, spectralInfo, academyPrinterDensityData) * frameConstants.print.x +
@@ -6610,6 +6885,67 @@ kernel void spektrafilm_print_density_from_print_raw(
   destination[index] = pixel;
 }
 
+kernel void spektrafilm_profile_print_scan_from_density(
+  device const float4 *printDensity [[buffer(0)]],
+  device float4 *destination [[buffer(1)]],
+  constant SpektraKernelParams &params [[buffer(2)]],
+  constant uint2 &dims [[buffer(3)]],
+  constant SpektraSpectralInfo &spectralInfo [[buffer(4)]],
+  constant SpektraColorInfo &colorInfo [[buffer(5)]],
+  device const float4 *paperSpectralDensity [[buffer(6)]],
+  device const float *scanProducts [[buffer(7)]],
+  device const float *scanToOutputRgbData [[buffer(8)]],
+  constant SpektraFrameConstants &frameConstants [[buffer(9)]],
+  uint2 gid [[thread_position_in_grid]]
+) {
+  if (gid.x >= dims.x || gid.y >= dims.y) {
+    return;
+  }
+  const uint index = gid.y * dims.x + gid.x;
+  const float4 pixel = printDensity[index];
+  device const float4 *packedScanProducts = (device const float4 *)scanProducts;
+  device const float4 *paperPackedScanProducts = packedScanProducts + spectralInfo.filmWavelengthCount;
+  device const float *legacyScanProducts = scanProducts + spectralInfo.filmWavelengthCount * 8u;
+  device const float *paperLegacyScanProducts = legacyScanProducts + spectralInfo.filmWavelengthCount * 3u;
+  device const float *scanInverseNormalizations = legacyScanProducts + spectralInfo.filmWavelengthCount * 6u;
+  device const float *paperScanToOutputRgb = scanToOutputRgbData + colorInfo.colorSpaceCount * 9u;
+  const float3 printDensityCmy = pixel.rgb;
+  const SpektraScanResult scan = spektra_scan_density_to_output_rgb_linear_y_cached_common(
+    printDensityCmy,
+    true,
+    params,
+    colorInfo,
+    spectralInfo,
+    paperSpectralDensity,
+    paperPackedScanProducts,
+    paperLegacyScanProducts,
+    scanInverseNormalizations[1],
+    paperScanToOutputRgb
+  );
+  destination[index] = float4(spektra_apply_print_scan_output_contract(scan, frameConstants, params), pixel.a);
+}
+
+kernel void spektrafilm_profile_finalize_output(
+  device const float4 *linearRgb [[buffer(0)]],
+  device float4 *destination [[buffer(1)]],
+  constant SpektraKernelParams &params [[buffer(2)]],
+  constant uint2 &dims [[buffer(3)]],
+  constant SpektraColorInfo &colorInfo [[buffer(4)]],
+  device const uint *transferKinds [[buffer(5)]],
+  device const float *encodeLuts [[buffer(6)]],
+  constant uint &encodeOutput [[buffer(7)]],
+  uint2 gid [[thread_position_in_grid]]
+) {
+  if (gid.x >= dims.x || gid.y >= dims.y) {
+    return;
+  }
+  const uint index = gid.y * dims.x + gid.x;
+  const float4 pixel = linearRgb[index];
+  destination[index] = encodeOutput != 0u
+    ? float4(spektra_finalize_output_rgb(pixel.rgb, params, colorInfo, encodeLuts, transferKinds), pixel.a)
+    : pixel;
+}
+
 kernel void spektrafilm_final_from_print_raw(
   device const float4 *printRaw [[buffer(0)]],
   device float4 *destination [[buffer(1)]],
@@ -6621,8 +6957,8 @@ kernel void spektrafilm_final_from_print_raw(
   constant SpektraSpectralInfo &spectralInfo [[buffer(7)]],
   constant SpektraColorInfo &colorInfo [[buffer(8)]],
   device const uint *transferKinds [[buffer(9)]],
-  device const float *paperScanDensityData [[buffer(10)]],
-  device const float *scanIlluminantsAndCmfs [[buffer(11)]],
+  device const float4 *paperSpectralDensity [[buffer(10)]],
+  device const float *scanProducts [[buffer(11)]],
   device const float *scanToOutputRgbData [[buffer(12)]],
   device const float *encodeLuts [[buffer(13)]],
   constant SpektraCurveInfo &filmCurveInfo [[buffer(14)]],
@@ -6634,7 +6970,7 @@ kernel void spektrafilm_final_from_print_raw(
   device const float *mallettBasisIlluminant [[buffer(20)]],
   device const float *inputToReferenceXyz [[buffer(21)]],
   device const float *filmChannelDensity [[buffer(22)]],
-  device const float *filmBaseDensity [[buffer(23)]],
+  device const float4 *filmSpectralDensity [[buffer(23)]],
   device const float *paperLogSensitivity [[buffer(24)]],
   device const float *thKg3Illuminant [[buffer(25)]],
   device const float *customEnlargerFilters [[buffer(26)]],
@@ -6651,29 +6987,23 @@ kernel void spektrafilm_final_from_print_raw(
   float4 pixel = printRaw[index];
   pixel.rgb = log10(max(pixel.rgb, float3(0.0)) + float3(1.0e-10));
   pixel.rgb = spektra_develop_print_density(pixel.rgb, params, spectralInfo, paperCurveInfo, paperLogExposure, paperDensityCurves);
-  device const float *paperChannelDensity = paperScanDensityData;
-  device const float *paperBaseDensity = paperScanDensityData + spectralInfo.filmWavelengthCount * 3u;
-  device const float *paperScanIlluminant = scanIlluminantsAndCmfs + spectralInfo.filmWavelengthCount;
-  device const float *standardObserverCmfs = scanIlluminantsAndCmfs + spectralInfo.filmWavelengthCount * 2u;
+  device const float4 *packedScanProducts = (device const float4 *)scanProducts;
+  device const float4 *paperPackedScanProducts = packedScanProducts + spectralInfo.filmWavelengthCount;
+  device const float *legacyScanProducts = scanProducts + spectralInfo.filmWavelengthCount * 8u;
+  device const float *paperLegacyScanProducts = legacyScanProducts + spectralInfo.filmWavelengthCount * 3u;
+  device const float *scanInverseNormalizations = legacyScanProducts + spectralInfo.filmWavelengthCount * 6u;
   device const float *paperScanToOutputRgb = scanToOutputRgbData + colorInfo.colorSpaceCount * 9u;
   const float3 printDensityCmy = pixel.rgb;
-  const float3 bypassedPrintDensityCmy = spektra_bleach_bypass_dye_density(
+  SpektraScanResult scan = spektra_scan_density_to_output_rgb_linear_y_cached_common(
     printDensityCmy,
-    params.printBleachBypassAmount,
-    true,
-    spectralInfo
-  );
-  SpektraScanResult scan = spektra_scan_density_to_output_rgb_linear_y(
-    bypassedPrintDensityCmy,
-    spektra_bleach_bypass_retained_silver_density(printDensityCmy, params.printBleachBypassAmount, true, spectralInfo),
     true,
     params,
     colorInfo,
     spectralInfo,
-    paperChannelDensity,
-    paperBaseDensity,
-    paperScanIlluminant,
-    standardObserverCmfs,
+    paperSpectralDensity,
+    paperPackedScanProducts,
+    paperLegacyScanProducts,
+    scanInverseNormalizations[1],
     paperScanToOutputRgb
   );
   pixel.rgb = spektra_apply_print_scan_output_contract(scan, frameConstants, params);
@@ -7112,6 +7442,7 @@ kernel void spektrafilm_scanner_finalize(
   constant SpektraColorInfo &colorInfo [[buffer(5)]],
   device const uint *transferKinds [[buffer(6)]],
   device const float *encodeLuts [[buffer(7)]],
+  constant uint &encodeOutput [[buffer(8)]],
   uint2 gid [[thread_position_in_grid]]
 ) {
   if (gid.x >= dims.x || gid.y >= dims.y) {
@@ -7124,7 +7455,9 @@ kernel void spektrafilm_scanner_finalize(
     const float3 sourceRgb = pixel.rgb;
     pixel.rgb = max(sourceRgb + params.scannerUnsharpAmount * (sourceRgb - blurred), min(sourceRgb, float3(0.0)));
   }
-  pixel.rgb = spektra_finalize_output_rgb(pixel.rgb, params, colorInfo, encodeLuts, transferKinds);
+  if (encodeOutput != 0u) {
+    pixel.rgb = spektra_finalize_output_rgb(pixel.rgb, params, colorInfo, encodeLuts, transferKinds);
+  }
   destination[index] = pixel;
 }
 
@@ -7137,6 +7470,7 @@ kernel void spektrafilm_scanner_finalize_texture(
   constant SpektraColorInfo &colorInfo [[buffer(3)]],
   device const uint *transferKinds [[buffer(4)]],
   device const float *encodeLuts [[buffer(5)]],
+  constant uint &encodeOutput [[buffer(6)]],
   uint2 gid [[thread_position_in_grid]]
 ) {
   if (gid.x >= dims.x || gid.y >= dims.y) {
@@ -7149,7 +7483,9 @@ kernel void spektrafilm_scanner_finalize_texture(
     const float3 sourceRgb = pixel.rgb;
     pixel.rgb = max(sourceRgb + params.scannerUnsharpAmount * (sourceRgb - blurred), min(sourceRgb, float3(0.0)));
   }
-  pixel.rgb = spektra_finalize_output_rgb(pixel.rgb, params, colorInfo, encodeLuts, transferKinds);
+  if (encodeOutput != 0u) {
+    pixel.rgb = spektra_finalize_output_rgb(pixel.rgb, params, colorInfo, encodeLuts, transferKinds);
+  }
   destination[index] = pixel;
 }
 

@@ -3,6 +3,7 @@
 layout(local_size_x = 32, local_size_y = 8, local_size_z = 1) in;
 
 const float kLog10E = 0.4342944819032518;
+const uint kColorAdaptationInputCompression = 1u << 0u;
 
 layout(std430, binding = 0) readonly buffer SourcePixels {
   vec4 src[];
@@ -55,6 +56,14 @@ layout(push_constant) uniform CoreParams {
   uint _pad2;
   int filmPushPullMode;
   float filmPushPullStops;
+  uint fullWidth;
+  uint fullHeight;
+  uint tileOriginX;
+  uint tileOriginY;
+  uint activeOriginX;
+  uint activeOriginY;
+  uint activeWidth;
+  uint activeHeight;
 } params;
 
 vec4 loadSourcePixel(uint index) {
@@ -67,6 +76,10 @@ void storeFilmRawPixel(uint index, vec4 value) {
 
 uint colorSpaceIndex() {
   return uint(clamp(params.inputColorSpace, 0, int(max(params.colorSpaceCount, 1u)) - 1));
+}
+
+bool colorAdaptationEnabled(uint flag) {
+  return (params._pad1 & flag) != 0u;
 }
 
 float sampleDecodeLut(float value, uint colorSpace) {
@@ -195,7 +208,7 @@ vec3 hanatosRaw(vec3 xyz) {
 
   vec3 raw = vec3(0.0);
   float weightSum = 0.0;
-  const uint responseOffset = params._pad1 != 0u
+  const uint responseOffset = colorAdaptationEnabled(kColorAdaptationInputCompression)
     ? params.hanatosWidth * params.hanatosHeight * 3u
     : 0u;
   for (uint i = 0u; i < 4u; ++i) {
@@ -219,15 +232,27 @@ vec3 hanatosRaw(vec3 xyz) {
 }
 
 void main() {
-  const uvec2 gid = gl_GlobalInvocationID.xy;
-  if (gid.x >= params.width || gid.y >= params.height) {
+  const uvec2 activeGid = gl_GlobalInvocationID.xy;
+  const uint activeWidth = params.activeWidth == 0u ? params.width : params.activeWidth;
+  const uint activeHeight = params.activeHeight == 0u ? params.height : params.activeHeight;
+  if (activeGid.x >= activeWidth || activeGid.y >= activeHeight) {
     return;
   }
 
+  const uvec2 gid = activeGid + uvec2(params.activeOriginX, params.activeOriginY);
+  if (gid.x >= params.width || gid.y >= params.height) {
+    return;
+  }
   const uint index = gid.y * params.width + gid.x;
+  const uvec2 absoluteGid = gid + uvec2(params.tileOriginX, params.tileOriginY);
+  const uint fullWidth = max(params.fullWidth, max(params.width, 1u));
+  const uint fullHeight = max(params.fullHeight, max(params.height, 1u));
+  const uint sourceIndex = params._pad2 == 1u
+    ? min(absoluteGid.y, fullHeight - 1u) * fullWidth + min(absoluteGid.x, fullWidth - 1u)
+    : index;
   const float exposure = exp2(params.filmExposureEv);
   const uint colorSpace = colorSpaceIndex();
-  const vec4 source = loadSourcePixel(index);
+  const vec4 source = loadSourcePixel(sourceIndex);
   const vec3 decoded = decodeInputRgb(source.rgb, colorSpace);
   const vec3 linearSrgb = multiplyInputToSrgb(decoded, colorSpace);
   const vec3 referenceXyz = multiplyInputToReferenceXyz(decoded, colorSpace);

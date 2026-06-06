@@ -169,6 +169,10 @@ inline constexpr ParamMetadata kParamMetadata[] = {
   {"hdrExposureEv", "colorGroup", flow()},
   {"hdrToneMapping", "colorGroup", flow()},
   {"colorAdaptation", "colorGroup", flow()},
+  {"colorAdaptationInputCompression", "colorGroup", kParamTagNone},
+  {"colorAdaptationCurveSmoothing", "colorGroup", kParamTagNone},
+  {"colorAdaptationOutputLightnessCompression", "colorGroup", kParamTagNone},
+  {"colorAdaptationOutputChromaCompression", "colorGroup", kParamTagNone},
 
   {"cameraUvFilterEnabled", "filteringGroup", kParamTagNone},
   {"cameraUvCutNm", "filteringGroup", kParamTagNone},
@@ -301,6 +305,8 @@ inline constexpr ParamMetadata kParamMetadata[] = {
   {"scannerMtf50LpMm", "scannerGroup", kParamTagNone},
   {"scannerUnsharpRadiusUm", "scannerGroup", kParamTagNone},
   {"scannerUnsharpAmount", "scannerGroup", kParamTagNone},
+
+  {"gpuRenderTiling", "manageGroup", kParamTagNone},
 
   {"infoVersion", "infoGroup", flow()},
   {"infoCreatedBy", "infoGroup", flow()},
@@ -443,6 +449,10 @@ inline constexpr ParamDefault kParamDefaults[] = {
   doubleDefault("hdrExposureEv", 0.0),
   intDefault("hdrToneMapping", 1),
   boolDefault("colorAdaptation", false),
+  boolDefault("colorAdaptationInputCompression", true),
+  boolDefault("colorAdaptationCurveSmoothing", true),
+  boolDefault("colorAdaptationOutputLightnessCompression", true),
+  boolDefault("colorAdaptationOutputChromaCompression", true),
 
   boolDefault("cameraUvFilterEnabled", false),
   doubleDefault("cameraUvCutNm", 410.0),
@@ -575,6 +585,8 @@ inline constexpr ParamDefault kParamDefaults[] = {
   doubleDefault("scannerMtf50LpMm", 60.0),
   doubleDefault("scannerUnsharpRadiusUm", 5.0),
   doubleDefault("scannerUnsharpAmount", 0.7),
+
+  intDefault("gpuRenderTiling", 0),
 };
 
 struct StoredParamValue {
@@ -586,6 +598,11 @@ struct StoredParamValue {
 using DefaultsSnapshot = std::unordered_map<std::string, StoredParamValue>;
 
 const DefaultsSnapshot *gDescribeDefaults = nullptr;
+int gDescriptorGrainSeedDefault = 0;
+
+bool isGrainSeedParam(const char *name) {
+  return name && std::strcmp(name, kGrainSeedParamName) == 0;
+}
 
 std::mt19937 makeGrainSeedRng() {
   uint32_t seedData[] = {
@@ -613,6 +630,11 @@ int randomGrainSeed() {
   std::lock_guard<std::mutex> lock(mutex);
   std::uniform_int_distribution<int> distribution(kGrainSeedMin, kGrainSeedMax);
   return distribution(rng);
+}
+
+int descriptorGrainSeedDefault() {
+  gDescriptorGrainSeedDefault = randomGrainSeed();
+  return gDescriptorGrainSeedDefault;
 }
 
 int paramComponentCount(ParamValueKind kind) {
@@ -660,6 +682,9 @@ StoredParamValue factoryStoredValue(const ParamDefault &entry) {
 }
 
 bool storedValueForDefault(const char *name, StoredParamValue &value) {
+  if (isGrainSeedParam(name)) {
+    return false;
+  }
   if (!gDescribeDefaults) {
     return false;
   }
@@ -692,6 +717,10 @@ struct InstanceData {
   OfxParamHandle hdrExposureEv = nullptr;
   OfxParamHandle hdrToneMapping = nullptr;
   OfxParamHandle colorAdaptation = nullptr;
+  OfxParamHandle colorAdaptationInputCompression = nullptr;
+  OfxParamHandle colorAdaptationCurveSmoothing = nullptr;
+  OfxParamHandle colorAdaptationOutputLightnessCompression = nullptr;
+  OfxParamHandle colorAdaptationOutputChromaCompression = nullptr;
   OfxParamHandle cameraUvFilterEnabled = nullptr;
   OfxParamHandle cameraUvCutNm = nullptr;
   OfxParamHandle cameraIrFilterEnabled = nullptr;
@@ -814,6 +843,7 @@ struct InstanceData {
   OfxParamHandle scannerMtf50LpMm = nullptr;
   OfxParamHandle scannerUnsharpRadiusUm = nullptr;
   OfxParamHandle scannerUnsharpAmount = nullptr;
+  OfxParamHandle gpuRenderTiling = nullptr;
   OfxParamHandle lutSize = nullptr;
   OfxParamHandle lutDestination = nullptr;
   OfxParamHandle lutIdentifier = nullptr;
@@ -1169,6 +1199,12 @@ void syncConditionalParamVisibility(InstanceData *data) {
   setParamSecretForFlavor(data->hdrExposureEv, "hdrExposureEv", !hdrOutput);
   setParamSecretForFlavor(data->hdrToneMapping, "hdrToneMapping", !hdrOutput);
 
+  const bool colorAdaptationEnabled = getBoolValue(data->colorAdaptation, false);
+  setParamSecretForFlavor(data->colorAdaptationInputCompression, "colorAdaptationInputCompression", !colorAdaptationEnabled);
+  setParamSecretForFlavor(data->colorAdaptationCurveSmoothing, "colorAdaptationCurveSmoothing", !colorAdaptationEnabled);
+  setParamSecretForFlavor(data->colorAdaptationOutputLightnessCompression, "colorAdaptationOutputLightnessCompression", !colorAdaptationEnabled);
+  setParamSecretForFlavor(data->colorAdaptationOutputChromaCompression, "colorAdaptationOutputChromaCompression", !colorAdaptationEnabled);
+
   const bool synthesisModel = getIntValue(data->grainModel, static_cast<int>(spektrafilm::GrainModel::Preview)) ==
     static_cast<int>(spektrafilm::GrainModel::GrainSynthesis);
   setParamSecretForFlavor(data->grainSynthesisSize, "grainSynthesisSize", !synthesisModel);
@@ -1364,6 +1400,17 @@ spektrafilm::RenderParams readParams(InstanceData *data, OfxTime time) {
   params.hdrExposureEv = static_cast<float>(getDoubleAtTime(data->hdrExposureEv, time, 0.0));
   params.hdrToneMapping = static_cast<spektrafilm::HdrToneMapping>(getIntAtTime(data->hdrToneMapping, time, 1));
   params.colorAdaptation = getBoolAtTime(data->colorAdaptation, time, false);
+  if (params.colorAdaptation && kPluginFlavor == PluginFlavor::Flow) {
+    params.colorAdaptationInputCompression = true;
+    params.colorAdaptationCurveSmoothing = true;
+    params.colorAdaptationOutputLightnessCompression = true;
+    params.colorAdaptationOutputChromaCompression = true;
+  } else {
+    params.colorAdaptationInputCompression = getBoolAtTime(data->colorAdaptationInputCompression, time, true);
+    params.colorAdaptationCurveSmoothing = getBoolAtTime(data->colorAdaptationCurveSmoothing, time, true);
+    params.colorAdaptationOutputLightnessCompression = getBoolAtTime(data->colorAdaptationOutputLightnessCompression, time, true);
+    params.colorAdaptationOutputChromaCompression = getBoolAtTime(data->colorAdaptationOutputChromaCompression, time, true);
+  }
   params.cameraUvFilterEnabled = getBoolAtTime(data->cameraUvFilterEnabled, time, false);
   params.cameraUvCutNm = static_cast<float>(getDoubleAtTime(data->cameraUvCutNm, time, 410.0));
   params.cameraIrFilterEnabled = getBoolAtTime(data->cameraIrFilterEnabled, time, false);
@@ -1563,6 +1610,9 @@ spektrafilm::RenderParams readParams(InstanceData *data, OfxTime time) {
   params.scannerMtf50LpMm = static_cast<float>(getDoubleAtTime(data->scannerMtf50LpMm, time, 60.0));
   params.scannerUnsharpRadiusUm = static_cast<float>(getDoubleAtTime(data->scannerUnsharpRadiusUm, time, 5.0));
   params.scannerUnsharpAmount = static_cast<float>(getDoubleAtTime(data->scannerUnsharpAmount, time, 0.7));
+  params.gpuRenderTiling = getIntAtTime(data->gpuRenderTiling, time, 0) == 1
+    ? spektrafilm::GpuRenderTilingMode::Tiled
+    : spektrafilm::GpuRenderTilingMode::LegacyFullFrame;
   return params;
 }
 
@@ -2412,10 +2462,26 @@ OfxParamHandle paramHandleForName(OfxParamSetHandle paramSet, const char *name) 
   return handle;
 }
 
-bool applySnapshotToParamSet(OfxParamSetHandle paramSet, const DefaultsSnapshot &snapshot) {
+void randomizeGrainSeedForNewInstance(InstanceData *data) {
+  if (!data || !data->grainSeed) {
+    return;
+  }
+  int current = 0;
+  if (gParamHost->paramGetValue(data->grainSeed, &current) != kOfxStatOK) {
+    return;
+  }
+  if (current == gDescriptorGrainSeedDefault || current == 0 || current == 1) {
+    gParamHost->paramSetValue(data->grainSeed, randomGrainSeed());
+  }
+}
+
+bool applySnapshotToParamSet(OfxParamSetHandle paramSet, const DefaultsSnapshot &snapshot, bool includeGrainSeed = true) {
   bool appliedAny = false;
   for (const ParamDefault &entry : kParamDefaults) {
     if (!shouldDefineParam(entry.name)) {
+      continue;
+    }
+    if (!includeGrainSeed && isGrainSeedParam(entry.name)) {
       continue;
     }
     const auto found = snapshot.find(entry.name);
@@ -2444,9 +2510,13 @@ bool resetParamSetToFactory(OfxParamSetHandle paramSet) {
   return resetAny;
 }
 
-void captureParamSetSnapshot(OfxParamSetHandle paramSet, OfxTime time, DefaultsSnapshot &snapshot) {
+void captureParamSetSnapshot(OfxParamSetHandle paramSet, OfxTime time, DefaultsSnapshot &snapshot, bool includeGrainSeed = true) {
   for (const ParamDefault &entry : kParamDefaults) {
     if (!shouldDefineParam(entry.name)) {
+      continue;
+    }
+    if (!includeGrainSeed && isGrainSeedParam(entry.name)) {
+      snapshot.erase(entry.name);
       continue;
     }
     OfxParamHandle handle = paramHandleForName(paramSet, entry.name);
@@ -2463,7 +2533,7 @@ bool saveVisibleDefaults(OfxParamSetHandle paramSet, OfxTime time, std::string &
   if (!loadDefaultsFromFile(snapshot, found, error)) {
     return false;
   }
-  captureParamSetSnapshot(paramSet, time, snapshot);
+  captureParamSetSnapshot(paramSet, time, snapshot, false);
   return saveDefaultsToFile(snapshot, error);
 }
 
@@ -3152,6 +3222,10 @@ OfxStatus createInstance(OfxImageEffectHandle effect) {
   cacheParam(paramSet, "hdrExposureEv", data->hdrExposureEv);
   cacheParam(paramSet, "hdrToneMapping", data->hdrToneMapping);
   cacheParam(paramSet, "colorAdaptation", data->colorAdaptation);
+  cacheParam(paramSet, "colorAdaptationInputCompression", data->colorAdaptationInputCompression);
+  cacheParam(paramSet, "colorAdaptationCurveSmoothing", data->colorAdaptationCurveSmoothing);
+  cacheParam(paramSet, "colorAdaptationOutputLightnessCompression", data->colorAdaptationOutputLightnessCompression);
+  cacheParam(paramSet, "colorAdaptationOutputChromaCompression", data->colorAdaptationOutputChromaCompression);
   cacheParam(paramSet, "cameraUvFilterEnabled", data->cameraUvFilterEnabled);
   cacheParam(paramSet, "cameraUvCutNm", data->cameraUvCutNm);
   cacheParam(paramSet, "cameraIrFilterEnabled", data->cameraIrFilterEnabled);
@@ -3274,6 +3348,7 @@ OfxStatus createInstance(OfxImageEffectHandle effect) {
   cacheParam(paramSet, "scannerMtf50LpMm", data->scannerMtf50LpMm);
   cacheParam(paramSet, "scannerUnsharpRadiusUm", data->scannerUnsharpRadiusUm);
   cacheParam(paramSet, "scannerUnsharpAmount", data->scannerUnsharpAmount);
+  cacheParam(paramSet, "gpuRenderTiling", data->gpuRenderTiling);
   cacheParam(paramSet, "lutSize", data->lutSize);
   cacheParam(paramSet, "lutDestination", data->lutDestination);
   cacheParam(paramSet, "lutIdentifier", data->lutIdentifier);
@@ -3283,8 +3358,9 @@ OfxStatus createInstance(OfxImageEffectHandle effect) {
   bool defaultsFound = false;
   std::string defaultsError;
   if (loadDefaultsFromFile(savedDefaults, defaultsFound, defaultsError) && defaultsFound) {
-    applySnapshotToParamSet(paramSet, savedDefaults);
+    applySnapshotToParamSet(paramSet, savedDefaults, false);
   }
+  randomizeGrainSeedForNewInstance(data);
   if (dirUsesStockCalibration(data)) {
     applyDirStockCalibration(data, false);
   }
@@ -4143,6 +4219,10 @@ OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHandle) {
   const char *hdrToneMappings[] = {"Soft Rolloff", "Hard Clip"};
   defineChoice(paramSet, "hdrToneMapping", "HDR Tone Mapping", hdrToneMappings, 2, 1, "colorGroup");
   defineBool(paramSet, "colorAdaptation", "Color Adaptation", false, "colorGroup");
+  defineBool(paramSet, "colorAdaptationInputCompression", "Input Compression", true, "colorGroup");
+  defineBool(paramSet, "colorAdaptationCurveSmoothing", "Curve Smoothing", true, "colorGroup");
+  defineBool(paramSet, "colorAdaptationOutputLightnessCompression", "Output Lightness Compression", true, "colorGroup");
+  defineBool(paramSet, "colorAdaptationOutputChromaCompression", "Output Chroma Compression", true, "colorGroup");
   defineBool(paramSet, "cameraUvFilterEnabled", "Filter UV", false, "filteringGroup");
   defineDouble(paramSet, "cameraUvCutNm", "UV Cut nm", 410.0, 380.0, 450.0, "filteringGroup");
   defineBool(paramSet, "cameraIrFilterEnabled", "Filter IR", false, "filteringGroup");
@@ -4233,7 +4313,7 @@ OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHandle) {
   defineDouble(paramSet, "grainFinalBlurUm", "Final Grain Blur", 7.17, 0.0, 25.0, "grainGroup");
   defineDouble(paramSet, "grainBlurDyeCloudsUm", "Dye Cloud Blur um", 1.0, 0.0, 10.0, "grainGroup");
   defineDouble2D(paramSet, "grainMicroStructure", "Micro Structure", 0.2, 30.0, "grainGroup");
-  defineInt(paramSet, kGrainSeedParamName, "Seed", randomGrainSeed(), kGrainSeedMin, kGrainSeedMax, "grainGroup");
+  defineInt(paramSet, kGrainSeedParamName, "Seed", descriptorGrainSeedDefault(), kGrainSeedMin, kGrainSeedMax, "grainGroup");
   defineBool(paramSet, "grainAnimate", "Animate", true, "grainGroup");
   defineDouble(paramSet, "grainSynthesisSize", "Synthesis Size", 1.0, 0.25, 4.0, "grainGroup");
   defineDouble(paramSet, "grainSynthesisAmount", "Synthesis Amount", 1.0, 0.0, 3.0, "grainGroup");
@@ -4296,6 +4376,8 @@ OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHandle) {
   defineLabel(paramSet, "infoVersion", "Version:", SPEKTRAFILM_VERSION_STRING, "infoGroup");
   defineLabel(paramSet, "infoCreatedBy", "Created by:", "Aedan Diez", "infoGroup");
   defineLabel(paramSet, "infoBasedOn", "Based on work by:", "Andrea Volpato & Johannes Hanika", "infoGroup");
+  const char *gpuRenderTilingOptions[] = {"Full-frame", "Experimental tiled"};
+  defineChoice(paramSet, "gpuRenderTiling", "GPU Render Tiling", gpuRenderTilingOptions, 2, 0, "manageGroup");
   const char *lutSizes[] = {"33", "65"};
   const char *lutDestinations[] = {"User", "DaVinci Resolve", "Nuke", "Adobe Creative", "Final Cut Pro"};
   defineChoice(paramSet, "lutSize", "LUT Size", lutSizes, 2, 1, "manageGroup");

@@ -146,6 +146,8 @@ Important paths in this directory:
 | `tools/ofx_stock_lists.py` | Film and paper stock ordering for OFX plugins. |
 | `tools/export_reference_cases.py` | Exports reference cases from the Python model for comparison work. |
 | `tools/SpektraMetalPerfHarness.mm` | Synthetic Metal performance harness for debugging and performance hunting. |
+| `tools/run_final_core_profile.py` | Focused fused/staged Metal profiling workflow for the final film-density core. |
+| `tools/perf_candidates_final_core.json` | Parity-gated exact and approximate final-core optimization candidates. |
 | `tools/SpektraMetalEvaluationHarness.mm` | Native evaluation harness. |
 | `tools/SpektraVulkanCopyHarness.cpp` | Windows/Linux Vulkan copy-validation smoke harness. |
 | `tools/SpektraVariantGenerator.mm` | Generates rendered variants for stock/look inspection (used for generating images of stocks for product website). |
@@ -325,6 +327,20 @@ controlled through compile definitions and parameter visibility rules in
 4. The vendored OpenFX SDK carries its own notices under `third_party/openfx/`.
 
 ## Development Notes
+
+For detailed profiling of `spektrafilm_final_from_film_density`, configure a
+source-enabled Metal build and run:
+
+```sh
+cmake -S . -B build-profile -DCMAKE_BUILD_TYPE=RelWithDebInfo -DSPEKTRAFILM_METAL_PROFILE_SOURCES=ON
+cmake --build build-profile --target SpektraFilmPerfHarness SpektraFilmParityHarness
+python3 tools/run_final_core_profile.py --build-dir build-profile --output profile-runs/final-core --capture-gputrace
+```
+
+The helper records representative fused timing, a diagnostic four-stage
+breakdown, and a threadgroup sweep. Staged mode adds intermediate writes and
+dispatch overhead, so only use it for attribution; use the fused result and
+parity-gated candidate sweep to judge optimizations.
 
 The plugin is still an active development project. The public flavors prioritize
 controls that are useful and reasonably defensible in grading workflows. The dev

@@ -71,6 +71,14 @@ layout(push_constant) uniform CoreParams {
   uint component;
   int filmPushPullMode;
   float filmPushPullStops;
+  uint fullWidth;
+  uint fullHeight;
+  uint tileOriginX;
+  uint tileOriginY;
+  uint activeOriginX;
+  uint activeOriginY;
+  uint activeWidth;
+  uint activeHeight;
 } params;
 
 vec4 loadIn0Pixel(uint index) { return in0[index]; }
@@ -230,11 +238,19 @@ void main() {
     storeBuf1Float(0u, vec4(maxRaw, rawX0, a, k));
     return;
   }
-  if (gid.x >= params.width || gid.y >= params.height) {
+  const uvec2 activeGid = gid;
+  const uint activeWidth = params.activeWidth == 0u ? params.width : params.activeWidth;
+  const uint activeHeight = params.activeHeight == 0u ? params.height : params.activeHeight;
+  if (activeGid.x >= activeWidth || activeGid.y >= activeHeight) {
     return;
   }
 
-  const uint index = gid.y * params.width + gid.x;
+  const uvec2 localGid = activeGid + uvec2(params.activeOriginX, params.activeOriginY);
+  if (localGid.x >= params.width || localGid.y >= params.height) {
+    return;
+  }
+  const uvec2 gid2 = localGid;
+  const uint index = gid2.y * params.width + gid2.x;
   if (params.operation == kOpBoostApply) {
     const vec4 raw = loadIn0Pixel(index);
     if (f(kFrameHalationBoostEv) <= 0.0) {
@@ -265,15 +281,15 @@ void main() {
     return;
   }
   if (params.operation == kOpBlurX) {
-    storeBuf1Pixel(index, gaussianSampleX(gid, sigmaForMode()));
+    storeBuf1Pixel(index, gaussianSampleX(gid2, sigmaForMode()));
     return;
   }
   if (params.operation == kOpBlurYStore) {
-    storeBuf1Pixel(index, gaussianSampleY(gid, sigmaForMode()));
+    storeBuf1Pixel(index, gaussianSampleY(gid2, sigmaForMode()));
     return;
   }
   if (params.operation == kOpBlurYAccumulate) {
-    const vec4 blurred = gaussianSampleY(gid, sigmaForMode());
+    const vec4 blurred = gaussianSampleY(gid2, sigmaForMode());
     const float weight = params.sigmaMode == kSigmaBounce
       ? pow(0.5, float(params.component)) / 1.75
       : scatterTailWeight(params.component);

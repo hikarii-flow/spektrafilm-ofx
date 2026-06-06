@@ -2,6 +2,8 @@
 
 layout(local_size_x = 32, local_size_y = 8, local_size_z = 1) in;
 
+const uint kColorAdaptationCurveSmoothing = 1u << 1u;
+
 layout(std430, binding = 0) readonly buffer FilmRawPixels {
   vec4 filmRaw[];
 };
@@ -37,6 +39,14 @@ layout(push_constant) uniform CoreParams {
   uint _pad2;
   int filmPushPullMode;
   float filmPushPullStops;
+  uint fullWidth;
+  uint fullHeight;
+  uint tileOriginX;
+  uint tileOriginY;
+  uint activeOriginX;
+  uint activeOriginY;
+  uint activeWidth;
+  uint activeHeight;
 } params;
 
 vec4 loadFilmRawPixel(uint index) {
@@ -45,6 +55,10 @@ vec4 loadFilmRawPixel(uint index) {
 
 void storeDestinationPixel(uint index, vec4 value) {
   dst[index] = value;
+}
+
+bool colorAdaptationEnabled(uint flag) {
+  return (params._pad1 & flag) != 0u;
 }
 
 float interpDensityCurve(float logRaw, uint channel) {
@@ -80,7 +94,7 @@ float interpDensityCurve(float logRaw, uint channel) {
   const float y0 = densityCurves[lo * 3u + channel];
   const float y1 = densityCurves[hi * 3u + channel];
   const float t = clamp((logRaw - x0) / max(x1 - x0, 1.0e-9), 0.0, 1.0);
-  if (params._pad1 != 0u && count > 2u) {
+  if (colorAdaptationEnabled(kColorAdaptationCurveSmoothing) && count > 2u) {
     const float dx0 = max(x1 - x0, 1.0e-9);
     const float d0 = (y1 - y0) / dx0;
     float m0 = d0;
@@ -215,11 +229,17 @@ vec3 developFilmDensity(vec3 logRaw) {
 }
 
 void main() {
-  const uvec2 gid = gl_GlobalInvocationID.xy;
-  if (gid.x >= params.width || gid.y >= params.height) {
+  const uvec2 activeGid = gl_GlobalInvocationID.xy;
+  const uint activeWidth = params.activeWidth == 0u ? params.width : params.activeWidth;
+  const uint activeHeight = params.activeHeight == 0u ? params.height : params.activeHeight;
+  if (activeGid.x >= activeWidth || activeGid.y >= activeHeight) {
     return;
   }
 
+  const uvec2 gid = activeGid + uvec2(params.activeOriginX, params.activeOriginY);
+  if (gid.x >= params.width || gid.y >= params.height) {
+    return;
+  }
   const uint index = gid.y * params.width + gid.x;
   const vec4 rawPixel = loadFilmRawPixel(index);
   const vec3 logRaw = rawPixel.rgb;

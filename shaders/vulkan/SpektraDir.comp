@@ -64,6 +64,14 @@ layout(push_constant) uniform CoreParams {
   uint _pad2;
   int filmPushPullMode;
   float filmPushPullStops;
+  uint fullWidth;
+  uint fullHeight;
+  uint tileOriginX;
+  uint tileOriginY;
+  uint activeOriginX;
+  uint activeOriginY;
+  uint activeWidth;
+  uint activeHeight;
 } params;
 
 vec4 loadInput0(uint index) { return in0[index]; }
@@ -278,11 +286,17 @@ float tailAmplitude(uint component) {
 }
 
 void main() {
-  const uvec2 gid = gl_GlobalInvocationID.xy;
-  if (gid.x >= params.width || gid.y >= params.height) {
+  const uvec2 activeGid = gl_GlobalInvocationID.xy;
+  const uint activeWidth = params.activeWidth == 0u ? params.width : params.activeWidth;
+  const uint activeHeight = params.activeHeight == 0u ? params.height : params.activeHeight;
+  if (activeGid.x >= activeWidth || activeGid.y >= activeHeight) {
     return;
   }
 
+  const uvec2 gid = activeGid + uvec2(params.activeOriginX, params.activeOriginY);
+  if (gid.x >= params.width || gid.y >= params.height) {
+    return;
+  }
   const uint index = gid.y * params.width + gid.x;
   if (params.operation == kOpCorrectionFromDensity) {
     const vec4 density = loadInput0(index);

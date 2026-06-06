@@ -338,6 +338,49 @@ bool copyMappedBytesToWindow(
   return true;
 }
 
+bool copyMappedBytesRegionToWindow(
+  const void *sourceBytes,
+  size_t sourceByteCount,
+  int32_t sourceWidth,
+  int32_t sourceHeight,
+  int32_t sourceX,
+  int32_t sourceY,
+  const MutableImageView &destination,
+  const RenderWindow &window,
+  int32_t width,
+  int32_t height
+) {
+  if (!sourceBytes || !destination.data || sourceWidth <= 0 || sourceHeight <= 0 ||
+      sourceX < 0 || sourceY < 0 || sourceX + width > sourceWidth || sourceY + height > sourceHeight ||
+      !windowFitsView(destination, window, width, height)) {
+    return false;
+  }
+
+  const int32_t pixelBytes = destination.components * destination.bytesPerComponent;
+  const int32_t sourceRowBytes = sourceWidth * pixelBytes;
+  const int32_t copyRowBytes = width * pixelBytes;
+  const size_t requiredBytes =
+    static_cast<size_t>(sourceHeight) * static_cast<size_t>(sourceRowBytes);
+  if (sourceByteCount < requiredBytes) {
+    return false;
+  }
+
+  const auto *sourceBase = static_cast<const uint8_t *>(sourceBytes);
+  auto *destinationBase = static_cast<uint8_t *>(destination.data);
+  const int32_t destinationX = window.x1 - destination.x1;
+  const int32_t destinationY0 = window.y1 - destination.y1;
+  for (int32_t y = 0; y < height; ++y) {
+    const uint8_t *src = sourceBase +
+      static_cast<size_t>(sourceY + y) * static_cast<size_t>(sourceRowBytes) +
+      static_cast<size_t>(sourceX) * static_cast<size_t>(pixelBytes);
+    uint8_t *dst = destinationBase +
+      static_cast<size_t>(destinationY0 + y) * static_cast<size_t>(destination.rowBytes) +
+      static_cast<size_t>(destinationX) * static_cast<size_t>(pixelBytes);
+    std::memcpy(dst, src, static_cast<size_t>(copyRowBytes));
+  }
+  return true;
+}
+
 uint32_t halfToFloatBits(uint16_t h) {
   const uint32_t sign = (static_cast<uint32_t>(h & 0x8000u)) << 16;
   uint32_t exponent = (h >> 10) & 0x1fu;
@@ -915,6 +958,101 @@ bool isDeviceLostError(const std::string &error) {
   return error.find("VK_ERROR_DEVICE_LOST") != std::string::npos;
 }
 
+GpuRenderTilingMode resolveVulkanTileMode(const RenderParams &params) {
+  const std::string mode = envString("SPEKTRAFILM_VULKAN_TILE_MODE", "");
+  if (mode == "legacy" || mode == "full-frame" || mode == "fullframe") {
+    return GpuRenderTilingMode::LegacyFullFrame;
+  }
+  if (mode == "tiled" || mode == "tile") {
+    return GpuRenderTilingMode::Tiled;
+  }
+  return params.gpuRenderTiling;
+}
+
+uint32_t envTileDimension(const char *name, uint32_t fallback) {
+  const std::string text = envString(name, "");
+  if (text.empty()) {
+    return fallback;
+  }
+  char *end = nullptr;
+  const long value = std::strtol(text.c_str(), &end, 10);
+  if (!end || *end != '\0' || value < 64 || value > 8192) {
+    return fallback;
+  }
+  return static_cast<uint32_t>(value);
+}
+
+constexpr uint32_t kVulkanGrainSpatialRadiusPx = 64u;
+constexpr uint32_t kVulkanSpatialEffectRadiusPx = 256u;
+constexpr uint32_t kDefaultVulkanTileWidth = 512u;
+constexpr uint32_t kDefaultVulkanTileHeight = 256u;
+
+uint32_t estimateVulkanTileOverlap(const RenderParams &params) {
+  uint32_t overlap = 0u;
+  const bool finalOutput = params.renderOutput == RenderOutputMode::FinalPreview;
+  const bool sceneHandoffOutput = finalOutput && params.outputRole == OutputRole::SceneHandoff;
+  const bool finalPrintSimulation =
+    finalOutput && !sceneHandoffOutput && params.process == ProcessMode::PrintSimulation;
+  const bool finalPostProcessPath =
+    finalOutput && (params.process == ProcessMode::ScanNegative || sceneHandoffOutput || finalPrintSimulation);
+
+  if (params.cameraDiffusionEnabled &&
+      params.cameraDiffusionStrength > 0.0f &&
+      params.cameraDiffusionSpatialScale > 0.0f) {
+    overlap += kVulkanSpatialEffectRadiusPx;
+  }
+  if (params.halationEnabled &&
+      ((params.scatterAmount > 0.0f && params.scatterScale > 0.0f) ||
+       (params.halationAmount > 0.0f &&
+        params.halationScale > 0.0f &&
+        (params.halationStrengthR > 0.0f ||
+         params.halationStrengthG > 0.0f ||
+         params.halationStrengthB > 0.0f)))) {
+    overlap += kVulkanSpatialEffectRadiusPx;
+  }
+  if (params.dirCouplersAmount > 0.0f &&
+      (params.dirCouplersDiffusionUm > 0.0f ||
+       (params.dirCouplersDiffusionTailUm > 0.0f && params.dirCouplersDiffusionTailWeight > 0.0f))) {
+    overlap += kVulkanSpatialEffectRadiusPx;
+  }
+  if (params.grainEnabled &&
+      (params.grainModel == GrainModel::Production ||
+       params.grainModel == GrainModel::GrainSynthesis)) {
+    overlap += kVulkanGrainSpatialRadiusPx;
+  }
+  if (finalPrintSimulation &&
+      params.printDiffusionEnabled &&
+      params.printDiffusionStrength > 0.0f &&
+      params.printDiffusionSpatialScale > 0.0f) {
+    overlap += kVulkanSpatialEffectRadiusPx;
+  }
+  if (finalPostProcessPath &&
+      params.scannerEnabled &&
+      ((params.glarePercent > 0.0f && params.glareBlur > 0.0f) ||
+       params.scannerMtf50LpMm > 0.0f ||
+       (params.scannerUnsharpRadiusUm > 0.0f && params.scannerUnsharpAmount > 0.0f))) {
+    overlap += kVulkanSpatialEffectRadiusPx;
+  }
+  return overlap;
+}
+
+uint32_t alignedReducedDimension(
+  uint32_t localSize,
+  uint32_t tileOrigin,
+  uint32_t fullSize,
+  uint32_t scale
+) {
+  if (localSize == 0u || fullSize == 0u) {
+    return 0u;
+  }
+  scale = std::max(scale, 1u);
+  const uint64_t start = static_cast<uint64_t>(tileOrigin) / scale;
+  const uint64_t localEnd =
+    std::min<uint64_t>(static_cast<uint64_t>(tileOrigin) + localSize, fullSize);
+  const uint64_t end = (localEnd + scale - 1u) / scale;
+  return static_cast<uint32_t>(std::max<uint64_t>(end > start ? end - start : 0u, 1u));
+}
+
 struct VulkanCorePushConstants {
   uint32_t width = 0;
   uint32_t height = 0;
@@ -934,9 +1072,17 @@ struct VulkanCorePushConstants {
   uint32_t _pad2 = 0;
   int32_t filmPushPullMode = 0;
   float filmPushPullStops = 0.0f;
+  uint32_t fullWidth = 0;
+  uint32_t fullHeight = 0;
+  uint32_t tileOriginX = 0;
+  uint32_t tileOriginY = 0;
+  uint32_t activeOriginX = 0;
+  uint32_t activeOriginY = 0;
+  uint32_t activeWidth = 0;
+  uint32_t activeHeight = 0;
 };
 
-static_assert(sizeof(VulkanCorePushConstants) == 72u);
+static_assert(sizeof(VulkanCorePushConstants) == 104u);
 
 struct VulkanDiffusionInfo {
   uint32_t componentCount = 0;
@@ -2310,6 +2456,8 @@ struct VulkanRenderer::Impl {
     ScratchBuffer halationBoostedRaw;
     ScratchBuffer halationBoostChunks;
     ScratchBuffer halationBoostInfo;
+    ScratchBuffer halationBoostInfoReadback;
+    ScratchBuffer tiledHalationBoostInfo;
     ScratchBuffer halationLogRaw;
     ScratchBuffer diffusionTemp;
     ScratchBuffer diffusionAccum;
@@ -2423,11 +2571,26 @@ struct VulkanRenderer::Impl {
   std::string dirTailBackend = "mps";
   bool halationGroupedTail = false;
   bool scannerMps = false;
-  std::mutex renderMutex;
+  std::recursive_mutex renderMutex;
   std::shared_ptr<VulkanSharedBackend> backend;
   uint32_t queueIndex = 0;
   uint64_t transientCachedBytes = 0;
   uint64_t lastUseSerial = 0;
+
+  struct ActiveTileContext {
+    bool enabled = false;
+    uint32_t fullWidth = 0;
+    uint32_t fullHeight = 0;
+    uint32_t tileOriginX = 0;
+    uint32_t tileOriginY = 0;
+    uint32_t centerOriginX = 0;
+    uint32_t centerOriginY = 0;
+    uint32_t centerWidth = 0;
+    uint32_t centerHeight = 0;
+    bool halationBoostMilestoneEnabled = false;
+    bool fullFrameSource = false;
+  };
+  ActiveTileContext activeTileContext;
 
   VkInstance instance = VK_NULL_HANDLE;
   VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
@@ -2565,6 +2728,21 @@ struct VulkanRenderer::Impl {
     const RenderParams &params,
     double time
   );
+  bool computeHalationBoostMilestone(
+    const ImageView &source,
+    const RenderWindow &window,
+    const RenderParams &params,
+    uint32_t centerTileWidth,
+    uint32_t centerTileHeight
+  );
+
+  bool renderTiledBootstrap(
+    const ImageView &source,
+    const MutableImageView &destination,
+    const RenderWindow &window,
+    const RenderParams &params,
+    double time
+  );
 
   bool createBuffer(
     VkDeviceSize size,
@@ -2686,6 +2864,8 @@ uint64_t VulkanRenderer::Impl::transientAllocationBytes() const {
   add(coreFrame.halationBoostedRaw);
   add(coreFrame.halationBoostChunks);
   add(coreFrame.halationBoostInfo);
+  add(coreFrame.halationBoostInfoReadback);
+  add(coreFrame.tiledHalationBoostInfo);
   add(coreFrame.halationLogRaw);
   add(coreFrame.diffusionTemp);
   add(coreFrame.diffusionAccum);
@@ -2775,7 +2955,7 @@ void VulkanRenderer::Impl::enforceTransientBudget() {
     if (total <= budget) {
       break;
     }
-    std::unique_lock<std::mutex> lock(candidate.renderer->renderMutex, std::try_to_lock);
+    std::unique_lock<std::recursive_mutex> lock(candidate.renderer->renderMutex, std::try_to_lock);
     if (!lock.owns_lock()) {
       continue;
     }
@@ -4017,6 +4197,8 @@ void VulkanRenderer::Impl::destroyCoreFrameResources() {
   destroyScratchBuffer(coreFrame.diffusionAccum);
   destroyScratchBuffer(coreFrame.diffusionTemp);
   destroyScratchBuffer(coreFrame.halationLogRaw);
+  destroyScratchBuffer(coreFrame.tiledHalationBoostInfo);
+  destroyScratchBuffer(coreFrame.halationBoostInfoReadback);
   destroyScratchBuffer(coreFrame.halationBoostInfo);
   destroyScratchBuffer(coreFrame.halationBoostChunks);
   destroyScratchBuffer(coreFrame.halationBoostedRaw);
@@ -4035,7 +4217,7 @@ void VulkanRenderer::Impl::destroyCoreFrameResources() {
 }
 
 void VulkanRenderer::Impl::releaseTransientResources() {
-  std::lock_guard<std::mutex> lock(renderMutex);
+  std::lock_guard<std::recursive_mutex> lock(renderMutex);
   releaseTransientResourcesNoLock();
 }
 
@@ -4055,7 +4237,7 @@ bool VulkanRenderer::Impl::renderCopyValidation(
   const RenderWindow &window,
   double
 ) {
-  std::lock_guard<std::mutex> lock(renderMutex);
+  std::lock_guard<std::recursive_mutex> lock(renderMutex);
   diagnostics = {};
   lastError.clear();
   updateSharedDiagnostics();
@@ -4274,7 +4456,7 @@ bool VulkanRenderer::Impl::renderCoreBootstrap(
   const RenderParams &params,
   double time
 ) {
-  std::lock_guard<std::mutex> lock(renderMutex);
+  std::lock_guard<std::recursive_mutex> lock(renderMutex);
   diagnostics = {};
   diagnostics.renderSerialized = true;
   lastError.clear();
@@ -4311,6 +4493,20 @@ bool VulkanRenderer::Impl::renderCoreBootstrap(
   const VkDeviceSize halfByteCount = static_cast<VkDeviceSize>(halfByteCount64);
   const VkDeviceSize grainLayerByteCount = static_cast<VkDeviceSize>(grainLayerByteCount64);
   const bool destinationIsHalf = destination.bytesPerComponent == 2;
+  const uint32_t coordinateWidth =
+    activeTileContext.enabled ? std::max(activeTileContext.fullWidth, 1u) : static_cast<uint32_t>(width);
+  const uint32_t coordinateHeight =
+    activeTileContext.enabled ? std::max(activeTileContext.fullHeight, 1u) : static_cast<uint32_t>(height);
+  const bool fullFrameSourcePath = activeTileContext.enabled && activeTileContext.fullFrameSource;
+  const uint64_t sourcePixelCount = fullFrameSourcePath
+    ? static_cast<uint64_t>(coordinateWidth) * static_cast<uint64_t>(coordinateHeight)
+    : pixelCount;
+  const uint64_t sourceByteCount64 = sourcePixelCount * 4u * sizeof(float);
+  if (sourcePixelCount == 0u || sourceByteCount64 > static_cast<uint64_t>(std::numeric_limits<VkDeviceSize>::max())) {
+    lastError = "The Vulkan source render window is too large.";
+    return false;
+  }
+  const VkDeviceSize sourceByteCount = static_cast<VkDeviceSize>(sourceByteCount64);
   const uint32_t halationBoostMaxChunkCount = static_cast<uint32_t>(
     (pixelCount + kHalationBoostMaxChunkPixels - 1u) / kHalationBoostMaxChunkPixels
   );
@@ -4318,7 +4514,7 @@ bool VulkanRenderer::Impl::renderCoreBootstrap(
     std::max<uint64_t>(halationBoostMaxChunkCount, 1u) * 4u * sizeof(float)
   );
   const float filmPixelSizeUm = filmFormatLongEdgeMm(params.filmFormat) * 1000.0f /
-    static_cast<float>(std::max(std::max(width, height), 1)) /
+    static_cast<float>(std::max(coordinateWidth, coordinateHeight)) /
     resolvedEnlargerScale(params);
   const bool finalOutput = params.renderOutput == RenderOutputMode::FinalPreview;
   const bool sceneHandoffOutput = finalOutput && params.outputRole == OutputRole::SceneHandoff;
@@ -4425,8 +4621,20 @@ bool VulkanRenderer::Impl::renderCoreBootstrap(
   const VkDeviceSize pixelStorageByteCount = byteCount;
   const VkDeviceSize diffusionTempByteCount =
     pixelStorageByteCount * static_cast<VkDeviceSize>(std::max(diffusionGroupSize, 1u));
+  const uint32_t maxDiffusionDownsampleWidth = alignedReducedDimension(
+    static_cast<uint32_t>(width),
+    activeTileContext.enabled ? activeTileContext.tileOriginX : 0u,
+    coordinateWidth,
+    2u
+  );
+  const uint32_t maxDiffusionDownsampleHeight = alignedReducedDimension(
+    static_cast<uint32_t>(height),
+    activeTileContext.enabled ? activeTileContext.tileOriginY : 0u,
+    coordinateHeight,
+    2u
+  );
   const uint64_t diffusionDownsamplePixelCount =
-    static_cast<uint64_t>((width + 1) / 2) * static_cast<uint64_t>((height + 1) / 2);
+    static_cast<uint64_t>(maxDiffusionDownsampleWidth) * static_cast<uint64_t>(maxDiffusionDownsampleHeight);
   const VkDeviceSize diffusionDownsampleByteCount =
     static_cast<VkDeviceSize>(diffusionDownsamplePixelCount * 4u * sizeof(float));
   const VkDeviceSize diffusionDownsampleGroupByteCount =
@@ -4446,9 +4654,18 @@ bool VulkanRenderer::Impl::renderCoreBootstrap(
   const bool halationBoostEnabled =
     halationFeatureEnabled &&
     params.halationBoostEv > 0.0f;
+  const bool halationBoostMilestoneEnabled =
+    halationBoostEnabled &&
+    activeTileContext.enabled &&
+    activeTileContext.halationBoostMilestoneEnabled;
+  const bool halationBoostLocalReductionEnabled =
+    halationBoostEnabled && !halationBoostMilestoneEnabled;
   const bool halationPassEnabled = halationBoostEnabled || halationScatterEnabled || halationBounceEnabled;
+  const uint32_t halationBoostPassCount = halationBoostEnabled
+    ? (halationBoostMilestoneEnabled ? 1u : 3u)
+    : 0u;
   const uint32_t halationExtraPassCount = halationPassEnabled
-    ? (halationBoostEnabled ? 3u : 0u) + (halationScatterEnabled ? 10u : 0u) +
+    ? halationBoostPassCount + (halationScatterEnabled ? 10u : 0u) +
         (halationBounceEnabled ? 8u : 1u)
     : 0u;
   auto diffusionBlurPassCount = [&](const std::vector<VulkanDiffusionComponent> &components) {
@@ -4486,6 +4703,16 @@ bool VulkanRenderer::Impl::renderCoreBootstrap(
     : 0u;
   const uint32_t grainExtraPassCount =
     previewGrainPath ? 1u : ((productionGrainPath || grainSynthesisPath) ? 10u : 0u);
+  const uint32_t cameraDiffusionRadius = cameraDiffusionPath ? kVulkanSpatialEffectRadiusPx : 0u;
+  const uint32_t halationRadius =
+    (halationScatterEnabled || halationBounceEnabled) ? kVulkanSpatialEffectRadiusPx : 0u;
+  const uint32_t dirRadius = dirBlurPath ? kVulkanSpatialEffectRadiusPx : 0u;
+  const uint32_t grainRadius =
+    (productionGrainPath || grainSynthesisPath) ? kVulkanGrainSpatialRadiusPx : 0u;
+  const uint32_t printDiffusionRadius = printDiffusionPath ? kVulkanSpatialEffectRadiusPx : 0u;
+  const uint32_t scannerPostRadius =
+    (printGlareBlurPath || scannerBlurPath || scannerUnsharpPath) ? kVulkanSpatialEffectRadiusPx : 0u;
+  const bool activeRectShrinkEnabled = activeTileContext.enabled;
   const bool frameParamsEnabled = printScanPassEnabled || halationPassEnabled || scannerPostPath || grainPath;
   const bool preExposureRawPath = cameraDiffusionPath || halationPassEnabled;
   const bool filmDensityIntermediateEnabled = printScanPassEnabled || dirPath || grainPath;
@@ -4494,7 +4721,7 @@ bool VulkanRenderer::Impl::renderCoreBootstrap(
     (params.filmPushPullMode == PushPullMode::Standard ? filmPushPullGamma(params.filmPushPullStops) : 1.0f);
   const float effectivePrintGamma = params.printGamma * printPushPullGamma(params.printPushPullStops);
 
-  diagnostics.uploadBytes = static_cast<uint64_t>(byteCount);
+  diagnostics.uploadBytes = fullFrameSourcePath ? 0u : static_cast<uint64_t>(byteCount);
   diagnostics.diffusionGroupSize = diffusionGroupSize;
   diagnostics.threadgroupMode = threadgroupMode;
   diagnostics.passTimingMode = "cpu-fence";
@@ -4525,13 +4752,14 @@ bool VulkanRenderer::Impl::renderCoreBootstrap(
 
   if (!prepareStaticFilmResources(params, printScanPassEnabled, productionGrainPath || grainSynthesisPath) ||
       !ensureCoreFrameResources() ||
-      !ensurePrivateScratchBuffer(coreFrame.source, pixelStorageByteCount, "core source") ||
+      !ensurePrivateScratchBuffer(coreFrame.source, sourceByteCount, fullFrameSourcePath ? "core full-frame source" : "core source") ||
       !ensurePrivateScratchBuffer(coreFrame.filmRaw, pixelStorageByteCount, "core film raw") ||
       !ensurePrivateScratchBuffer(coreFrame.destination, pixelStorageByteCount, "core destination")) {
     return false;
   }
   const uint32_t formatGroups = static_cast<uint32_t>((pixelCount + 255u) / 256u);
-  if (!ensureUploadScratchBuffer(
+  if (!fullFrameSourcePath &&
+      !ensureUploadScratchBuffer(
         coreFrame.sourceStaging,
         byteCount,
         "core source staging",
@@ -4569,11 +4797,19 @@ bool VulkanRenderer::Impl::renderCoreBootstrap(
        !ensurePrivateScratchBuffer(coreFrame.halationLogRaw, pixelStorageByteCount, "core halation log raw"))) {
     return false;
   }
-  if (halationBoostEnabled &&
-      (!ensurePrivateScratchBuffer(coreFrame.halationBoostedRaw, pixelStorageByteCount, "core halation boosted raw") ||
-       !ensurePrivateScratchBuffer(coreFrame.halationBoostChunks, halationBoostChunkByteCount, "core halation boost chunks") ||
-       !ensurePrivateScratchBuffer(coreFrame.halationBoostInfo, 4u * sizeof(float), "core halation boost info"))) {
-    return false;
+  if (halationBoostEnabled) {
+    if (!ensurePrivateScratchBuffer(coreFrame.halationBoostedRaw, pixelStorageByteCount, "core halation boosted raw")) {
+      return false;
+    }
+    if (halationBoostLocalReductionEnabled &&
+        (!ensurePrivateScratchBuffer(coreFrame.halationBoostChunks, halationBoostChunkByteCount, "core halation boost chunks") ||
+         !ensurePrivateScratchBuffer(coreFrame.halationBoostInfo, 4u * sizeof(float), "core halation boost info"))) {
+      return false;
+    }
+    if (halationBoostMilestoneEnabled && coreFrame.tiledHalationBoostInfo.buffer == VK_NULL_HANDLE) {
+      lastError = "Vulkan tiled halation boost milestone info is unavailable.";
+      return false;
+    }
   }
   if ((cameraDiffusionPath || printDiffusionPath) &&
       (!ensurePrivateScratchBuffer(coreFrame.diffusionTemp, diffusionTempByteCount, "core diffusion temp") ||
@@ -4635,30 +4871,32 @@ bool VulkanRenderer::Impl::renderCoreBootstrap(
 
   float autoExposureEv = 0.0f;
   const PerfClock::time_point sourceCopyStart = PerfClock::now();
-  if (!coreFrame.sourceStaging.mapped) {
-    lastError = "Vulkan source staging buffer is not mapped.";
-    return false;
-  }
-  if (params.autoExposure) {
-    std::vector<float> sourcePixels(static_cast<size_t>(pixelCount) * 4u);
-    if (!copySourceToFloatStaging(source, window, width, height, sourcePixels.data())) {
+  if (!fullFrameSourcePath) {
+    if (!coreFrame.sourceStaging.mapped) {
+      lastError = "Vulkan source staging buffer is not mapped.";
+      return false;
+    }
+    if (params.autoExposure) {
+      std::vector<float> sourcePixels(static_cast<size_t>(pixelCount) * 4u);
+      if (!copySourceToFloatStaging(source, window, width, height, sourcePixels.data())) {
+        lastError = "The requested render window does not fit inside the Vulkan source image view.";
+        return false;
+      }
+      autoExposureEv = measureAutoExposureEv(sourcePixels.data(), width, height, params);
+      std::memcpy(coreFrame.sourceStaging.mapped, sourcePixels.data(), static_cast<size_t>(byteCount));
+    } else if (!copySourceToFloatStaging(
+                 source,
+                 window,
+                 width,
+                 height,
+                 static_cast<float *>(coreFrame.sourceStaging.mapped)
+               )) {
       lastError = "The requested render window does not fit inside the Vulkan source image view.";
       return false;
     }
-    autoExposureEv = measureAutoExposureEv(sourcePixels.data(), width, height, params);
-    std::memcpy(coreFrame.sourceStaging.mapped, sourcePixels.data(), static_cast<size_t>(byteCount));
-  } else if (!copySourceToFloatStaging(
-               source,
-               window,
-               width,
-               height,
-               static_cast<float *>(coreFrame.sourceStaging.mapped)
-             )) {
-    lastError = "The requested render window does not fit inside the Vulkan source image view.";
-    return false;
-  }
-  if (!flushMappedScratchBuffer(coreFrame.sourceStaging, byteCount, "core source staging")) {
-    return false;
+    if (!flushMappedScratchBuffer(coreFrame.sourceStaging, byteCount, "core source staging")) {
+      return false;
+    }
   }
   const PerfClock::time_point sourceCopyEnd = PerfClock::now();
   diagnostics.sourceCopyMs = elapsedMilliseconds(sourceCopyStart, sourceCopyEnd);
@@ -4855,7 +5093,7 @@ bool VulkanRenderer::Impl::renderCoreBootstrap(
     frameInts[24] = params.grainSynthesisLayered ? 1u : 0u;
     frameInts[25] = grainSynthesisPath ? 1u : 0u;
     frameInts[26] = grainBlurRecurrence ? 1u : 0u;
-    frameInts[27] = params.colorAdaptation ? 1u : 0u;
+    frameInts[27] = colorAdaptationFlags(params);
 
     if (!coreFrame.frameFloats.mapped || !coreFrame.frameInts.mapped) {
       lastError = "Vulkan frame parameter buffers are not mapped.";
@@ -4872,7 +5110,7 @@ bool VulkanRenderer::Impl::renderCoreBootstrap(
   VkDescriptorBufferInfo sourceBufferInfo{};
   sourceBufferInfo.buffer = coreFrame.source.buffer;
   sourceBufferInfo.offset = 0;
-  sourceBufferInfo.range = pixelStorageByteCount;
+  sourceBufferInfo.range = sourceByteCount;
   VkDescriptorBufferInfo filmRawBufferInfo{};
   filmRawBufferInfo.buffer = coreFrame.filmRaw.buffer;
   filmRawBufferInfo.offset = 0;
@@ -5034,6 +5272,10 @@ bool VulkanRenderer::Impl::renderCoreBootstrap(
   halationBoostInfoBufferInfo.buffer = coreFrame.halationBoostInfo.buffer;
   halationBoostInfoBufferInfo.offset = 0;
   halationBoostInfoBufferInfo.range = coreFrame.halationBoostInfo.capacity;
+  VkDescriptorBufferInfo tiledHalationBoostInfoBufferInfo{};
+  tiledHalationBoostInfoBufferInfo.buffer = coreFrame.tiledHalationBoostInfo.buffer;
+  tiledHalationBoostInfoBufferInfo.offset = 0;
+  tiledHalationBoostInfoBufferInfo.range = coreFrame.tiledHalationBoostInfo.capacity;
   VkDescriptorBufferInfo halationLogRawBufferInfo{};
   halationLogRawBufferInfo.buffer = coreFrame.halationLogRaw.buffer;
   halationLogRawBufferInfo.offset = 0;
@@ -5468,25 +5710,30 @@ bool VulkanRenderer::Impl::renderCoreBootstrap(
   }
   if (halationPassEnabled) {
     if (halationBoostEnabled) {
-      writeHalationSet(
-        coreFrame.halationDescriptorSets[10],
-        filmRawBufferInfo,
-        halationBoostChunksBufferInfo,
-        halationBoostInfoBufferInfo,
-        halationBoostedRawBufferInfo
-      );
-      writeHalationSet(
-        coreFrame.halationDescriptorSets[11],
-        halationBoostChunksBufferInfo,
-        halationBoostInfoBufferInfo,
-        halationBoostInfoBufferInfo,
-        halationBoostedRawBufferInfo
-      );
+      if (halationBoostLocalReductionEnabled) {
+        writeHalationSet(
+          coreFrame.halationDescriptorSets[10],
+          filmRawBufferInfo,
+          halationBoostChunksBufferInfo,
+          halationBoostInfoBufferInfo,
+          halationBoostedRawBufferInfo
+        );
+        writeHalationSet(
+          coreFrame.halationDescriptorSets[11],
+          halationBoostChunksBufferInfo,
+          halationBoostInfoBufferInfo,
+          halationBoostInfoBufferInfo,
+          halationBoostedRawBufferInfo
+        );
+      }
+      const VkDescriptorBufferInfo &boostApplyInfoBufferInfo = halationBoostMilestoneEnabled
+        ? tiledHalationBoostInfoBufferInfo
+        : halationBoostInfoBufferInfo;
       writeHalationSet(
         coreFrame.halationDescriptorSets[12],
         filmRawBufferInfo,
         halationBoostedRawBufferInfo,
-        halationBoostInfoBufferInfo,
+        boostApplyInfoBufferInfo,
         halationBoostedRawBufferInfo
       );
     }
@@ -5567,26 +5814,28 @@ bool VulkanRenderer::Impl::renderCoreBootstrap(
     nullptr
   );
 
-  VkBufferCopy sourceUploadRegion{};
-  sourceUploadRegion.size = pixelStorageByteCount;
-  vkCmdCopyBuffer(commandBuffer, coreFrame.sourceStaging.buffer, coreFrame.source.buffer, 1, &sourceUploadRegion);
+  if (!fullFrameSourcePath) {
+    VkBufferCopy sourceUploadRegion{};
+    sourceUploadRegion.size = pixelStorageByteCount;
+    vkCmdCopyBuffer(commandBuffer, coreFrame.sourceStaging.buffer, coreFrame.source.buffer, 1, &sourceUploadRegion);
 
-  VkMemoryBarrier sourceUploadBarrier{};
-  sourceUploadBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-  sourceUploadBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-  sourceUploadBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-  vkCmdPipelineBarrier(
-    commandBuffer,
-    VK_PIPELINE_STAGE_TRANSFER_BIT,
-    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-    0,
-    1,
-    &sourceUploadBarrier,
-    0,
-    nullptr,
-    0,
-    nullptr
-  );
+    VkMemoryBarrier sourceUploadBarrier{};
+    sourceUploadBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    sourceUploadBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    sourceUploadBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(
+      commandBuffer,
+      VK_PIPELINE_STAGE_TRANSFER_BIT,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      0,
+      1,
+      &sourceUploadBarrier,
+      0,
+      nullptr,
+      0,
+      nullptr
+    );
+  }
 
   VulkanCorePushConstants pushConstants{};
   pushConstants.width = static_cast<uint32_t>(width);
@@ -5604,9 +5853,83 @@ bool VulkanRenderer::Impl::renderCoreBootstrap(
   pushConstants.hanatosHeight = staticFilm.hanatosHeight;
   pushConstants.filmPushPullMode = static_cast<int32_t>(params.filmPushPullMode);
   pushConstants.filmPushPullStops = params.filmPushPullStops;
+  pushConstants.fullWidth = coordinateWidth;
+  pushConstants.fullHeight = coordinateHeight;
+  pushConstants.tileOriginX = activeTileContext.enabled ? activeTileContext.tileOriginX : 0u;
+  pushConstants.tileOriginY = activeTileContext.enabled ? activeTileContext.tileOriginY : 0u;
 
-  const uint32_t groupsX = (pushConstants.width + 31u) / 32u;
-  const uint32_t groupsY = (pushConstants.height + 7u) / 8u;
+  struct ActiveRect {
+    uint32_t x = 0;
+    uint32_t y = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+  };
+  const ActiveRect centerRect = activeTileContext.enabled
+    ? ActiveRect{
+        std::min(activeTileContext.centerOriginX, pushConstants.width),
+        std::min(activeTileContext.centerOriginY, pushConstants.height),
+        std::min(activeTileContext.centerWidth, pushConstants.width - std::min(activeTileContext.centerOriginX, pushConstants.width)),
+        std::min(activeTileContext.centerHeight, pushConstants.height - std::min(activeTileContext.centerOriginY, pushConstants.height))
+      }
+    : ActiveRect{0u, 0u, pushConstants.width, pushConstants.height};
+  auto inflatedCenterRect = [&](uint32_t radius) {
+    const uint32_t x0 = centerRect.x > radius ? centerRect.x - radius : 0u;
+    const uint32_t y0 = centerRect.y > radius ? centerRect.y - radius : 0u;
+    const uint32_t x1 = std::min<uint32_t>(
+      pushConstants.width,
+      centerRect.x + centerRect.width > std::numeric_limits<uint32_t>::max() - radius
+        ? pushConstants.width
+        : centerRect.x + centerRect.width + radius
+    );
+    const uint32_t y1 = std::min<uint32_t>(
+      pushConstants.height,
+      centerRect.y + centerRect.height > std::numeric_limits<uint32_t>::max() - radius
+        ? pushConstants.height
+        : centerRect.y + centerRect.height + radius
+    );
+    return ActiveRect{x0, y0, x1 > x0 ? x1 - x0 : 0u, y1 > y0 ? y1 - y0 : 0u};
+  };
+  auto setActiveRect = [&](const ActiveRect &rect) {
+    pushConstants.activeOriginX = std::min(rect.x, pushConstants.width);
+    pushConstants.activeOriginY = std::min(rect.y, pushConstants.height);
+    pushConstants.activeWidth = std::min(rect.width, pushConstants.width - pushConstants.activeOriginX);
+    pushConstants.activeHeight = std::min(rect.height, pushConstants.height - pushConstants.activeOriginY);
+    if (pushConstants.activeWidth == 0u || pushConstants.activeHeight == 0u) {
+      pushConstants.activeOriginX = 0u;
+      pushConstants.activeOriginY = 0u;
+      pushConstants.activeWidth = pushConstants.width;
+      pushConstants.activeHeight = pushConstants.height;
+    }
+  };
+  uint32_t remainingSpatialRadius =
+    cameraDiffusionRadius +
+    halationRadius +
+    dirRadius +
+    grainRadius +
+    printDiffusionRadius +
+    scannerPostRadius;
+  auto setActiveForRemainingRadius = [&]() {
+    if (!activeRectShrinkEnabled) {
+      setActiveRect(ActiveRect{0u, 0u, pushConstants.width, pushConstants.height});
+      return;
+    }
+    setActiveRect(inflatedCenterRect(remainingSpatialRadius));
+  };
+  auto consumeSpatialRadius = [&](uint32_t radius) {
+    if (!activeRectShrinkEnabled) {
+      return;
+    }
+    remainingSpatialRadius = remainingSpatialRadius > radius ? remainingSpatialRadius - radius : 0u;
+    setActiveForRemainingRadius();
+  };
+  setActiveForRemainingRadius();
+
+  auto activeGroupsX = [&]() {
+    return (std::max(pushConstants.activeWidth, 1u) + 31u) / 32u;
+  };
+  auto activeGroupsY = [&]() {
+    return (std::max(pushConstants.activeHeight, 1u) + 7u) / 8u;
+  };
   auto insertComputeBarrier = [&]() {
     VkMemoryBarrier barrier{};
     barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
@@ -5632,7 +5955,7 @@ bool VulkanRenderer::Impl::renderCoreBootstrap(
     vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, halationPipeline);
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, corePipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
     vkCmdPushConstants(commandBuffer, corePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pushConstants), &pushConstants);
-    vkCmdDispatch(commandBuffer, groupsX, groupsY, 1);
+    vkCmdDispatch(commandBuffer, activeGroupsX(), activeGroupsY(), 1);
     insertComputeBarrier();
   };
   auto dispatchHalation1D = [&](VkDescriptorSet descriptorSet, uint32_t operation, uint32_t value, uint32_t itemCount) {
@@ -5652,7 +5975,22 @@ bool VulkanRenderer::Impl::renderCoreBootstrap(
     vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, diffusionPipeline);
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, corePipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
     vkCmdPushConstants(commandBuffer, corePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pushConstants), &pushConstants);
-    vkCmdDispatch(commandBuffer, groupsX, groupsY, 1);
+    vkCmdDispatch(commandBuffer, activeGroupsX(), activeGroupsY(), 1);
+    insertComputeBarrier();
+  };
+  auto dispatchDiffusionActiveSized = [&](
+    VkDescriptorSet descriptorSet,
+    uint32_t operation,
+    uint32_t value1,
+    uint32_t value2
+  ) {
+    pushConstants._pad0 = operation;
+    pushConstants._pad1 = value1;
+    pushConstants._pad2 = value2;
+    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, diffusionPipeline);
+    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, corePipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
+    vkCmdPushConstants(commandBuffer, corePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pushConstants), &pushConstants);
+    vkCmdDispatch(commandBuffer, activeGroupsX(), activeGroupsY(), 1);
     insertComputeBarrier();
   };
   auto dispatchDiffusionSized = [&](
@@ -5697,26 +6035,36 @@ bool VulkanRenderer::Impl::renderCoreBootstrap(
           dispatchDiffusion(descriptorSet, kDiffusionOpBlurX, component);
           dispatchDiffusion(descriptorSet, kDiffusionOpBlurYAccumulate, component);
         } else {
-          dispatchDiffusionSized(descriptorSet, kDiffusionOpGroupBlurX, component, groupCount, pushConstants.width, pushConstants.height);
-          dispatchDiffusionSized(descriptorSet, kDiffusionOpGroupBlurYAccumulate, component, groupCount, pushConstants.width, pushConstants.height);
+          dispatchDiffusionActiveSized(descriptorSet, kDiffusionOpGroupBlurX, component, groupCount);
+          dispatchDiffusionActiveSized(descriptorSet, kDiffusionOpGroupBlurYAccumulate, component, groupCount);
         }
         component += groupCount;
         continue;
       }
 
-      const uint32_t reducedWidth = (pushConstants.width + downsampleScale - 1u) / downsampleScale;
-      const uint32_t reducedHeight = (pushConstants.height + downsampleScale - 1u) / downsampleScale;
+      const uint32_t reducedWidth = alignedReducedDimension(
+        pushConstants.width,
+        pushConstants.tileOriginX,
+        pushConstants.fullWidth,
+        downsampleScale
+      );
+      const uint32_t reducedHeight = alignedReducedDimension(
+        pushConstants.height,
+        pushConstants.tileOriginY,
+        pushConstants.fullHeight,
+        downsampleScale
+      );
       dispatchDiffusionSized(descriptorSet, kDiffusionOpDownsample, downsampleScale, 0u, reducedWidth, reducedHeight);
       if (groupCount <= 1u) {
         const uint32_t packed = packDiffusionGroup(1u, downsampleScale);
         dispatchDiffusionSized(descriptorSet, kDiffusionOpDownsampleBlurX, component, packed, reducedWidth, reducedHeight);
         dispatchDiffusionSized(descriptorSet, kDiffusionOpDownsampleBlurY, component, packed, reducedWidth, reducedHeight);
-        dispatchDiffusionSized(descriptorSet, kDiffusionOpDownsampleUpsampleAccumulate, component, packed, pushConstants.width, pushConstants.height);
+        dispatchDiffusionActiveSized(descriptorSet, kDiffusionOpDownsampleUpsampleAccumulate, component, packed);
       } else {
         const uint32_t packed = packDiffusionGroup(groupCount, downsampleScale);
         dispatchDiffusionSized(descriptorSet, kDiffusionOpDownsampleGroupBlurX, component, packed, reducedWidth, reducedHeight);
         dispatchDiffusionSized(descriptorSet, kDiffusionOpDownsampleGroupBlurY, component, packed, reducedWidth, reducedHeight);
-        dispatchDiffusionSized(descriptorSet, kDiffusionOpDownsampleGroupUpsampleAccumulate, component, packed, pushConstants.width, pushConstants.height);
+        dispatchDiffusionActiveSized(descriptorSet, kDiffusionOpDownsampleGroupUpsampleAccumulate, component, packed);
       }
       component += groupCount;
     }
@@ -5729,7 +6077,7 @@ bool VulkanRenderer::Impl::renderCoreBootstrap(
     vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, dirPipeline);
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, corePipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
     vkCmdPushConstants(commandBuffer, corePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pushConstants), &pushConstants);
-    vkCmdDispatch(commandBuffer, groupsX, groupsY, 1);
+    vkCmdDispatch(commandBuffer, activeGroupsX(), activeGroupsY(), 1);
     insertComputeBarrier();
   };
   auto dispatchGrain = [&](VkDescriptorSet descriptorSet, uint32_t operation, uint32_t depth) {
@@ -5739,37 +6087,40 @@ bool VulkanRenderer::Impl::renderCoreBootstrap(
     vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, grainPipeline);
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, corePipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
     vkCmdPushConstants(commandBuffer, corePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pushConstants), &pushConstants);
-    vkCmdDispatch(commandBuffer, groupsX, groupsY, depth);
+    vkCmdDispatch(commandBuffer, activeGroupsX(), activeGroupsY(), depth);
     insertComputeBarrier();
   };
 
   pushConstants._pad0 = preExposureRawPath ? 1u : 0u;
-  pushConstants._pad1 = params.colorAdaptation ? 1u : 0u;
-  pushConstants._pad2 = 0u;
+  pushConstants._pad1 = colorAdaptationFlags(params);
+  pushConstants._pad2 = fullFrameSourcePath ? 1u : 0u;
   vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, filmExposurePipeline);
   vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, corePipelineLayout, 0, 1, &coreFrame.exposureDescriptorSet, 0, nullptr);
   vkCmdPushConstants(commandBuffer, corePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pushConstants), &pushConstants);
-  vkCmdDispatch(commandBuffer, groupsX, groupsY, 1);
+  vkCmdDispatch(commandBuffer, activeGroupsX(), activeGroupsY(), 1);
   insertComputeBarrier();
 
   if (halationBoostEnabled) {
-    dispatchHalation1D(
-      coreFrame.halationDescriptorSets[10],
-      kHalationOpBoostMax,
-      kHalationBoostMaxChunkPixels,
-      halationBoostMaxChunkCount
-    );
-    dispatchHalation1D(
-      coreFrame.halationDescriptorSets[11],
-      kHalationOpBoostReduceMax,
-      halationBoostMaxChunkCount,
-      1u
-    );
+    if (halationBoostLocalReductionEnabled) {
+      dispatchHalation1D(
+        coreFrame.halationDescriptorSets[10],
+        kHalationOpBoostMax,
+        kHalationBoostMaxChunkPixels,
+        halationBoostMaxChunkCount
+      );
+      dispatchHalation1D(
+        coreFrame.halationDescriptorSets[11],
+        kHalationOpBoostReduceMax,
+        halationBoostMaxChunkCount,
+        1u
+      );
+    }
     dispatchHalation(coreFrame.halationDescriptorSets[12], kHalationOpBoostApply, 0u, 0u);
   }
 
   if (cameraDiffusionPath) {
     dispatchDiffusionSequence(coreFrame.diffusionDescriptorSets[0], cameraDiffusionComponents);
+    consumeSpatialRadius(cameraDiffusionRadius);
     if (!halationPassEnabled) {
       dispatchDiffusion(coreFrame.diffusionDescriptorSets[1], kDiffusionOpRawToLog, 0u);
     }
@@ -5796,15 +6147,16 @@ bool VulkanRenderer::Impl::renderCoreBootstrap(
     } else {
       dispatchHalation(coreFrame.halationDescriptorSets[9], kHalationOpRawToLog, 0u, 0u);
     }
+    consumeSpatialRadius(halationRadius);
   }
 
   pushConstants._pad0 = 0u;
-  pushConstants._pad1 = params.colorAdaptation ? 1u : 0u;
+  pushConstants._pad1 = colorAdaptationFlags(params);
   pushConstants._pad2 = 0u;
   vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, curveDevelopPipeline);
   vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, corePipelineLayout, 0, 1, &coreFrame.developDescriptorSet, 0, nullptr);
   vkCmdPushConstants(commandBuffer, corePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pushConstants), &pushConstants);
-  vkCmdDispatch(commandBuffer, groupsX, groupsY, 1);
+  vkCmdDispatch(commandBuffer, activeGroupsX(), activeGroupsY(), 1);
 
   if (dirPath) {
     insertComputeBarrier();
@@ -5821,6 +6173,7 @@ bool VulkanRenderer::Impl::renderCoreBootstrap(
       }
     }
     dispatchDir(coreFrame.dirDescriptorSets[6], kDirOpRedevelop, 0u);
+    consumeSpatialRadius(dirRadius);
   }
 
   if (grainPath) {
@@ -5838,6 +6191,7 @@ bool VulkanRenderer::Impl::renderCoreBootstrap(
       dispatchGrain(coreFrame.grainDescriptorSets[2], kGrainOpDensityBlurX, 1u);
       dispatchGrain(coreFrame.grainDescriptorSets[3], kGrainOpDensityBlurY, 1u);
       dispatchGrain(coreFrame.grainDescriptorSets[4], kGrainOpApplyControls, 1u);
+      consumeSpatialRadius(grainRadius);
     } else if (grainSynthesisPath) {
       dispatchGrain(coreFrame.grainDescriptorSets[1], kGrainOpSynthesisLayers, 9u);
       dispatchGrain(coreFrame.grainDescriptorSets[1], kGrainOpLayerBlurX, 9u);
@@ -5849,6 +6203,7 @@ bool VulkanRenderer::Impl::renderCoreBootstrap(
       dispatchGrain(coreFrame.grainDescriptorSets[2], kGrainOpDensityBlurX, 1u);
       dispatchGrain(coreFrame.grainDescriptorSets[3], kGrainOpDensityBlurY, 1u);
       dispatchGrain(coreFrame.grainDescriptorSets[4], kGrainOpCopyDensity, 1u);
+      consumeSpatialRadius(grainRadius);
     }
   }
 
@@ -5862,10 +6217,11 @@ bool VulkanRenderer::Impl::renderCoreBootstrap(
       pushConstants._pad2 = 0u;
       vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, corePipelineLayout, 0, 1, &coreFrame.printDiffusionDescriptorSets[0], 0, nullptr);
       vkCmdPushConstants(commandBuffer, corePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pushConstants), &pushConstants);
-      vkCmdDispatch(commandBuffer, groupsX, groupsY, 1);
+      vkCmdDispatch(commandBuffer, activeGroupsX(), activeGroupsY(), 1);
       insertComputeBarrier();
 
       dispatchDiffusionSequence(coreFrame.diffusionDescriptorSets[2], printDiffusionComponents);
+      consumeSpatialRadius(printDiffusionRadius);
 
       pushConstants._pad0 = kPrintScanOpFinalFromPrintRaw;
       pushConstants._pad1 = scannerPostPath ? 1u : 0u;
@@ -5879,7 +6235,7 @@ bool VulkanRenderer::Impl::renderCoreBootstrap(
       vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, corePipelineLayout, 0, 1, &coreFrame.finalDescriptorSet, 0, nullptr);
     }
     vkCmdPushConstants(commandBuffer, corePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pushConstants), &pushConstants);
-    vkCmdDispatch(commandBuffer, groupsX, groupsY, 1);
+    vkCmdDispatch(commandBuffer, activeGroupsX(), activeGroupsY(), 1);
   }
 
   auto dispatchScannerPost = [&](VkDescriptorSet descriptorSet, uint32_t operation) {
@@ -5889,7 +6245,7 @@ bool VulkanRenderer::Impl::renderCoreBootstrap(
     vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, scannerPostPipeline);
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, corePipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
     vkCmdPushConstants(commandBuffer, corePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pushConstants), &pushConstants);
-    vkCmdDispatch(commandBuffer, groupsX, groupsY, 1);
+    vkCmdDispatch(commandBuffer, activeGroupsX(), activeGroupsY(), 1);
     insertComputeBarrier();
   };
 
@@ -5912,6 +6268,7 @@ bool VulkanRenderer::Impl::renderCoreBootstrap(
       dispatchScannerPost(coreFrame.scannerPostDescriptorSets[7], kScannerPostOpUnsharpBlurY);
     }
     dispatchScannerPost(coreFrame.scannerPostDescriptorSets[8], kScannerPostOpFinalize);
+    consumeSpatialRadius(scannerPostRadius);
   }
 
   VkPipelineStageFlags hostBarrierSourceStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
@@ -6114,8 +6471,8 @@ bool VulkanRenderer::Impl::renderCoreBootstrap(
     diagnostics.passes.push_back(pass);
   };
   auto addDiffusionPasses = [&](const char *prefix, const std::vector<VulkanDiffusionComponent> &components) {
-    const uint32_t fullWidth = static_cast<uint32_t>(width);
-    const uint32_t fullHeight = static_cast<uint32_t>(height);
+    const uint32_t localWidth = static_cast<uint32_t>(width);
+    const uint32_t localHeight = static_cast<uint32_t>(height);
     const uint64_t fullBytes = static_cast<uint64_t>(pixelStorageByteCount) * 2u;
     addComputePass(std::string(prefix) + "_diffusion_clear");
     for (uint32_t component = 0u; component < static_cast<uint32_t>(components.size());) {
@@ -6140,8 +6497,18 @@ bool VulkanRenderer::Impl::renderCoreBootstrap(
         component += groupCount;
         continue;
       }
-      const uint32_t reducedWidth = (fullWidth + downsampleScale - 1u) / downsampleScale;
-      const uint32_t reducedHeight = (fullHeight + downsampleScale - 1u) / downsampleScale;
+      const uint32_t reducedWidth = alignedReducedDimension(
+        localWidth,
+        activeTileContext.enabled ? activeTileContext.tileOriginX : 0u,
+        coordinateWidth,
+        downsampleScale
+      );
+      const uint32_t reducedHeight = alignedReducedDimension(
+        localHeight,
+        activeTileContext.enabled ? activeTileContext.tileOriginY : 0u,
+        coordinateHeight,
+        downsampleScale
+      );
       const uint64_t reducedBytes =
         static_cast<uint64_t>(reducedWidth) * static_cast<uint64_t>(reducedHeight) * 4u * sizeof(float) * 2u;
       const std::string base = std::string(prefix) + "_diffusion_downsample";
@@ -6149,12 +6516,12 @@ bool VulkanRenderer::Impl::renderCoreBootstrap(
       if (groupCount <= 1u) {
         addComputePassSize(base + "_blur_x", reducedWidth, reducedHeight, 1u, reducedBytes);
         addComputePassSize(base + "_blur_y", reducedWidth, reducedHeight, 1u, reducedBytes);
-        addComputePassSize(base + "_upsample_accumulate", fullWidth, fullHeight, 1u, fullBytes);
+        addComputePassSize(base + "_upsample_accumulate", localWidth, localHeight, 1u, fullBytes);
       } else {
         const uint64_t groupBytes = reducedBytes * static_cast<uint64_t>(groupCount);
         addComputePassSize(base + "_group_blur_x", reducedWidth, reducedHeight, groupCount, groupBytes);
         addComputePassSize(base + "_group_blur_y", reducedWidth, reducedHeight, groupCount, groupBytes);
-        addComputePassSize(base + "_group_upsample_accumulate", fullWidth, fullHeight, groupCount, fullBytes);
+        addComputePassSize(base + "_group_upsample_accumulate", localWidth, localHeight, groupCount, fullBytes);
       }
       component += groupCount;
     }
@@ -6168,8 +6535,10 @@ bool VulkanRenderer::Impl::renderCoreBootstrap(
   }
   if (halationPassEnabled) {
     if (halationBoostEnabled) {
-      addComputePass("spektrafilm_halation_boost_max");
-      addComputePass("spektrafilm_halation_boost_reduce_max");
+      if (halationBoostLocalReductionEnabled) {
+        addComputePass("spektrafilm_halation_boost_max");
+        addComputePass("spektrafilm_halation_boost_reduce_max");
+      }
       addComputePass("spektrafilm_halation_boost_apply");
     }
     if (halationScatterEnabled) {
@@ -6281,6 +6650,785 @@ bool VulkanRenderer::Impl::renderCoreBootstrap(
   return true;
 }
 
+bool VulkanRenderer::Impl::computeHalationBoostMilestone(
+  const ImageView &source,
+  const RenderWindow &window,
+  const RenderParams &params,
+  uint32_t centerTileWidth,
+  uint32_t centerTileHeight
+) {
+  const int32_t fullWidth = window.x2 - window.x1;
+  const int32_t fullHeight = window.y2 - window.y1;
+  if (fullWidth <= 0 || fullHeight <= 0) {
+    return true;
+  }
+  if (!windowFitsView(source, window, fullWidth, fullHeight)) {
+    lastError = "The requested halation boost milestone window does not fit inside the Vulkan source image view.";
+    return false;
+  }
+
+  centerTileWidth = std::max(centerTileWidth, 1u);
+  centerTileHeight = std::max(centerTileHeight, 1u);
+  const uint32_t tileColumns =
+    (static_cast<uint32_t>(fullWidth) + centerTileWidth - 1u) / centerTileWidth;
+  const uint32_t tileRows =
+    (static_cast<uint32_t>(fullHeight) + centerTileHeight - 1u) / centerTileHeight;
+
+  if (!prepareStaticFilmResources(params, false, false) || !ensureCoreFrameResources()) {
+    return false;
+  }
+
+  std::array<float, kCoreFrameFloatCount> frameFloats{};
+  frameFloats[75] = params.halationBoostEv;
+  frameFloats[76] = params.halationBoostRange;
+  frameFloats[77] = params.halationProtectEv;
+  if (!uploadScratchBuffer(
+        coreFrame.frameFloats,
+        frameFloats.data(),
+        static_cast<VkDeviceSize>(frameFloats.size() * sizeof(float)),
+        "core halation boost milestone frame params"
+      )) {
+    return false;
+  }
+
+  VkDescriptorBufferInfo logExposureBufferInfo{};
+  logExposureBufferInfo.buffer = staticFilm.logExposure.buffer;
+  logExposureBufferInfo.offset = 0;
+  logExposureBufferInfo.range = staticFilm.logExposure.capacity;
+  VkDescriptorBufferInfo densityCurvesBufferInfo{};
+  densityCurvesBufferInfo.buffer = staticFilm.densityCurves.buffer;
+  densityCurvesBufferInfo.offset = 0;
+  densityCurvesBufferInfo.range = staticFilm.densityCurves.capacity;
+  VkDescriptorBufferInfo inputToSrgbBufferInfo{};
+  inputToSrgbBufferInfo.buffer = staticFilm.inputToSrgb.buffer;
+  inputToSrgbBufferInfo.offset = 0;
+  inputToSrgbBufferInfo.range = staticFilm.inputToSrgb.capacity;
+  VkDescriptorBufferInfo colorDecodeLutsBufferInfo{};
+  colorDecodeLutsBufferInfo.buffer = staticFilm.colorDecodeLuts.buffer;
+  colorDecodeLutsBufferInfo.offset = 0;
+  colorDecodeLutsBufferInfo.range = staticFilm.colorDecodeLuts.capacity;
+  VkDescriptorBufferInfo colorTransferKindsBufferInfo{};
+  colorTransferKindsBufferInfo.buffer = staticFilm.colorTransferKinds.buffer;
+  colorTransferKindsBufferInfo.offset = 0;
+  colorTransferKindsBufferInfo.range = staticFilm.colorTransferKinds.capacity;
+  VkDescriptorBufferInfo mallettRawMatrixBufferInfo{};
+  mallettRawMatrixBufferInfo.buffer = staticFilm.mallettRawMatrix.buffer;
+  mallettRawMatrixBufferInfo.offset = 0;
+  mallettRawMatrixBufferInfo.range = staticFilm.mallettRawMatrix.capacity;
+  VkDescriptorBufferInfo inputToReferenceXyzBufferInfo{};
+  inputToReferenceXyzBufferInfo.buffer = staticFilm.inputToReferenceXyz.buffer;
+  inputToReferenceXyzBufferInfo.offset = 0;
+  inputToReferenceXyzBufferInfo.range = staticFilm.inputToReferenceXyz.capacity;
+  VkDescriptorBufferInfo hanatosRawResponseBufferInfo{};
+  hanatosRawResponseBufferInfo.buffer = staticFilm.hanatosRawResponse.buffer;
+  hanatosRawResponseBufferInfo.offset = 0;
+  hanatosRawResponseBufferInfo.range = staticFilm.hanatosRawResponse.capacity;
+
+  float globalMaxRaw = 0.0f;
+  for (uint32_t tileY = 0u; tileY < tileRows; ++tileY) {
+    for (uint32_t tileX = 0u; tileX < tileColumns; ++tileX) {
+      const int32_t tileX0 = window.x1 + static_cast<int32_t>(tileX * centerTileWidth);
+      const int32_t tileY0 = window.y1 + static_cast<int32_t>(tileY * centerTileHeight);
+      const int32_t tileX1 = std::min(window.x2, tileX0 + static_cast<int32_t>(centerTileWidth));
+      const int32_t tileY1 = std::min(window.y2, tileY0 + static_cast<int32_t>(centerTileHeight));
+      const int32_t tileWidth = tileX1 - tileX0;
+      const int32_t tileHeight = tileY1 - tileY0;
+      if (tileWidth <= 0 || tileHeight <= 0) {
+        continue;
+      }
+
+      const uint64_t pixelCount =
+        static_cast<uint64_t>(tileWidth) * static_cast<uint64_t>(tileHeight);
+      const uint64_t byteCount64 = pixelCount * 4u * sizeof(float);
+      if (byteCount64 > static_cast<uint64_t>(std::numeric_limits<VkDeviceSize>::max()) ||
+          byteCount64 > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+        lastError = "The Vulkan halation boost milestone tile is too large.";
+        return false;
+      }
+      const VkDeviceSize byteCount = static_cast<VkDeviceSize>(byteCount64);
+      const uint32_t chunkCount = static_cast<uint32_t>(
+        (pixelCount + kHalationBoostMaxChunkPixels - 1u) / kHalationBoostMaxChunkPixels
+      );
+      const VkDeviceSize chunkByteCount = static_cast<VkDeviceSize>(
+        std::max<uint64_t>(chunkCount, 1u) * 4u * sizeof(float)
+      );
+
+      if (!ensureUploadScratchBuffer(
+            coreFrame.sourceStaging,
+            byteCount,
+            "core halation boost milestone source staging",
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT
+          ) ||
+          !ensurePrivateScratchBuffer(coreFrame.source, byteCount, "core halation boost milestone source") ||
+          !ensurePrivateScratchBuffer(coreFrame.filmRaw, byteCount, "core halation boost milestone film raw") ||
+          !ensurePrivateScratchBuffer(
+            coreFrame.halationBoostChunks,
+            chunkByteCount,
+            "core halation boost milestone chunks"
+          ) ||
+          !ensurePrivateScratchBuffer(
+            coreFrame.halationBoostInfo,
+            4u * sizeof(float),
+            "core halation boost milestone info"
+          ) ||
+          !ensureReadbackScratchBuffer(
+            coreFrame.halationBoostInfoReadback,
+            4u * sizeof(float),
+            "core halation boost milestone info readback",
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT
+          )) {
+        return false;
+      }
+
+      if (!coreFrame.sourceStaging.mapped) {
+        lastError = "Vulkan halation boost milestone source staging buffer is not mapped.";
+        return false;
+      }
+      const RenderWindow tileWindow{tileX0, tileY0, tileX1, tileY1};
+      if (!copySourceToFloatStaging(
+            source,
+            tileWindow,
+            tileWidth,
+            tileHeight,
+            static_cast<float *>(coreFrame.sourceStaging.mapped)
+          )) {
+        lastError = "The requested halation boost milestone tile does not fit inside the Vulkan source image view.";
+        return false;
+      }
+      if (!flushMappedScratchBuffer(coreFrame.sourceStaging, byteCount, "core halation boost milestone source staging")) {
+        return false;
+      }
+
+      VkDescriptorBufferInfo sourceBufferInfo{};
+      sourceBufferInfo.buffer = coreFrame.source.buffer;
+      sourceBufferInfo.offset = 0;
+      sourceBufferInfo.range = byteCount;
+      VkDescriptorBufferInfo filmRawBufferInfo{};
+      filmRawBufferInfo.buffer = coreFrame.filmRaw.buffer;
+      filmRawBufferInfo.offset = 0;
+      filmRawBufferInfo.range = byteCount;
+      VkDescriptorBufferInfo halationBoostChunksBufferInfo{};
+      halationBoostChunksBufferInfo.buffer = coreFrame.halationBoostChunks.buffer;
+      halationBoostChunksBufferInfo.offset = 0;
+      halationBoostChunksBufferInfo.range = coreFrame.halationBoostChunks.capacity;
+      VkDescriptorBufferInfo halationBoostInfoBufferInfo{};
+      halationBoostInfoBufferInfo.buffer = coreFrame.halationBoostInfo.buffer;
+      halationBoostInfoBufferInfo.offset = 0;
+      halationBoostInfoBufferInfo.range = coreFrame.halationBoostInfo.capacity;
+      VkDescriptorBufferInfo frameFloatsBufferInfo{};
+      frameFloatsBufferInfo.buffer = coreFrame.frameFloats.buffer;
+      frameFloatsBufferInfo.offset = 0;
+      frameFloatsBufferInfo.range = coreFrame.frameFloats.capacity;
+
+      std::array<VkWriteDescriptorSet, 20> writes{};
+      uint32_t writeCount = 0;
+      auto writeStorageBuffer = [&](VkDescriptorSet set, uint32_t binding, const VkDescriptorBufferInfo &bufferInfo) {
+        VkWriteDescriptorSet &write = writes[writeCount++];
+        write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        write.dstSet = set;
+        write.dstBinding = binding;
+        write.descriptorCount = 1;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        write.pBufferInfo = &bufferInfo;
+      };
+      writeStorageBuffer(coreFrame.exposureDescriptorSet, 0, sourceBufferInfo);
+      writeStorageBuffer(coreFrame.exposureDescriptorSet, 1, filmRawBufferInfo);
+      writeStorageBuffer(coreFrame.exposureDescriptorSet, 2, logExposureBufferInfo);
+      writeStorageBuffer(coreFrame.exposureDescriptorSet, 3, densityCurvesBufferInfo);
+      writeStorageBuffer(coreFrame.exposureDescriptorSet, 4, inputToSrgbBufferInfo);
+      writeStorageBuffer(coreFrame.exposureDescriptorSet, 5, colorDecodeLutsBufferInfo);
+      writeStorageBuffer(coreFrame.exposureDescriptorSet, 6, colorTransferKindsBufferInfo);
+      writeStorageBuffer(coreFrame.exposureDescriptorSet, 7, mallettRawMatrixBufferInfo);
+      writeStorageBuffer(coreFrame.exposureDescriptorSet, 8, inputToReferenceXyzBufferInfo);
+      writeStorageBuffer(coreFrame.exposureDescriptorSet, 9, hanatosRawResponseBufferInfo);
+      writeStorageBuffer(coreFrame.halationDescriptorSets[10], 0, filmRawBufferInfo);
+      writeStorageBuffer(coreFrame.halationDescriptorSets[10], 1, halationBoostChunksBufferInfo);
+      writeStorageBuffer(coreFrame.halationDescriptorSets[10], 2, halationBoostInfoBufferInfo);
+      writeStorageBuffer(coreFrame.halationDescriptorSets[10], 3, filmRawBufferInfo);
+      writeStorageBuffer(coreFrame.halationDescriptorSets[10], 27, frameFloatsBufferInfo);
+      writeStorageBuffer(coreFrame.halationDescriptorSets[11], 0, halationBoostChunksBufferInfo);
+      writeStorageBuffer(coreFrame.halationDescriptorSets[11], 1, halationBoostInfoBufferInfo);
+      writeStorageBuffer(coreFrame.halationDescriptorSets[11], 2, halationBoostInfoBufferInfo);
+      writeStorageBuffer(coreFrame.halationDescriptorSets[11], 3, filmRawBufferInfo);
+      writeStorageBuffer(coreFrame.halationDescriptorSets[11], 27, frameFloatsBufferInfo);
+      vkUpdateDescriptorSets(device, writeCount, writes.data(), 0, nullptr);
+
+      VkCommandBuffer commandBuffer = coreFrame.commandBuffer;
+      VkResult result = vkResetCommandBuffer(commandBuffer, 0);
+      if (result != VK_SUCCESS) {
+        lastError = vkError("vkResetCommandBuffer(halation boost milestone)", result);
+        return false;
+      }
+
+      VkCommandBufferBeginInfo beginInfo{};
+      beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+      beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+      result = vkBeginCommandBuffer(commandBuffer, &beginInfo);
+      if (result != VK_SUCCESS) {
+        lastError = vkError("vkBeginCommandBuffer(halation boost milestone)", result);
+        return false;
+      }
+
+      VkMemoryBarrier hostInputBarrier{};
+      hostInputBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+      hostInputBarrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+      hostInputBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
+      vkCmdPipelineBarrier(
+        commandBuffer,
+        VK_PIPELINE_STAGE_HOST_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0,
+        1,
+        &hostInputBarrier,
+        0,
+        nullptr,
+        0,
+        nullptr
+      );
+
+      VkBufferCopy sourceUploadRegion{};
+      sourceUploadRegion.size = byteCount;
+      vkCmdCopyBuffer(commandBuffer, coreFrame.sourceStaging.buffer, coreFrame.source.buffer, 1, &sourceUploadRegion);
+
+      VkMemoryBarrier sourceUploadBarrier{};
+      sourceUploadBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+      sourceUploadBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+      sourceUploadBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+      vkCmdPipelineBarrier(
+        commandBuffer,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0,
+        1,
+        &sourceUploadBarrier,
+        0,
+        nullptr,
+        0,
+        nullptr
+      );
+
+      VulkanCorePushConstants pushConstants{};
+      pushConstants.width = static_cast<uint32_t>(tileWidth);
+      pushConstants.height = static_cast<uint32_t>(tileHeight);
+      pushConstants.filmExposureEv = params.filmExposureEv;
+      pushConstants.filmGamma = params.filmGamma *
+        (params.filmPushPullMode == PushPullMode::Standard ? filmPushPullGamma(params.filmPushPullStops) : 1.0f);
+      pushConstants.exposureCount = staticFilm.exposureCount;
+      pushConstants.inputColorSpace = static_cast<int32_t>(params.inputColorSpace);
+      pushConstants.rgbToRawMethod = static_cast<int32_t>(params.rgbToRawMethod);
+      pushConstants.colorSpaceCount = kSpektraColorSpaceCount;
+      pushConstants.transferLutSize = kSpektraColorTransferLutSize;
+      pushConstants.colorDecodeMin = colorDecodeLutMin();
+      pushConstants.colorDecodeMax = colorDecodeLutMax();
+      pushConstants.hanatosWidth = staticFilm.hanatosWidth;
+      pushConstants.hanatosHeight = staticFilm.hanatosHeight;
+      pushConstants.filmPushPullMode = static_cast<int32_t>(params.filmPushPullMode);
+      pushConstants.filmPushPullStops = params.filmPushPullStops;
+      pushConstants.fullWidth = static_cast<uint32_t>(fullWidth);
+      pushConstants.fullHeight = static_cast<uint32_t>(fullHeight);
+      pushConstants.tileOriginX = static_cast<uint32_t>(tileX0 - window.x1);
+      pushConstants.tileOriginY = static_cast<uint32_t>(tileY0 - window.y1);
+
+      const uint32_t groupsX = (pushConstants.width + 31u) / 32u;
+      const uint32_t groupsY = (pushConstants.height + 7u) / 8u;
+      auto insertComputeBarrier = [&]() {
+        VkMemoryBarrier barrier{};
+        barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        vkCmdPipelineBarrier(
+          commandBuffer,
+          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+          0,
+          1,
+          &barrier,
+          0,
+          nullptr,
+          0,
+          nullptr
+        );
+      };
+
+      pushConstants._pad0 = 1u;
+      pushConstants._pad1 = colorAdaptationFlags(params);
+      pushConstants._pad2 = 0u;
+      vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, filmExposurePipeline);
+      vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, corePipelineLayout, 0, 1, &coreFrame.exposureDescriptorSet, 0, nullptr);
+      vkCmdPushConstants(commandBuffer, corePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pushConstants), &pushConstants);
+      vkCmdDispatch(commandBuffer, groupsX, groupsY, 1);
+      insertComputeBarrier();
+
+      auto dispatchHalation1D = [&](VkDescriptorSet descriptorSet, uint32_t operation, uint32_t value, uint32_t itemCount) {
+        pushConstants._pad0 = operation;
+        pushConstants._pad1 = value;
+        pushConstants._pad2 = 0u;
+        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, halationPipeline);
+        vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, corePipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
+        vkCmdPushConstants(commandBuffer, corePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pushConstants), &pushConstants);
+        vkCmdDispatch(commandBuffer, (std::max(itemCount, 1u) + 31u) / 32u, 1u, 1u);
+        insertComputeBarrier();
+      };
+      dispatchHalation1D(
+        coreFrame.halationDescriptorSets[10],
+        kHalationOpBoostMax,
+        kHalationBoostMaxChunkPixels,
+        chunkCount
+      );
+      dispatchHalation1D(
+        coreFrame.halationDescriptorSets[11],
+        kHalationOpBoostReduceMax,
+        chunkCount,
+        1u
+      );
+
+      VkMemoryBarrier readbackInputBarrier{};
+      readbackInputBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+      readbackInputBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+      readbackInputBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+      vkCmdPipelineBarrier(
+        commandBuffer,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0,
+        1,
+        &readbackInputBarrier,
+        0,
+        nullptr,
+        0,
+        nullptr
+      );
+
+      VkBufferCopy boostInfoReadbackRegion{};
+      boostInfoReadbackRegion.size = 4u * sizeof(float);
+      vkCmdCopyBuffer(
+        commandBuffer,
+        coreFrame.halationBoostInfo.buffer,
+        coreFrame.halationBoostInfoReadback.buffer,
+        1,
+        &boostInfoReadbackRegion
+      );
+
+      VkMemoryBarrier hostReadbackBarrier{};
+      hostReadbackBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+      hostReadbackBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+      hostReadbackBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+      vkCmdPipelineBarrier(
+        commandBuffer,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_HOST_BIT,
+        0,
+        1,
+        &hostReadbackBarrier,
+        0,
+        nullptr,
+        0,
+        nullptr
+      );
+
+      result = vkEndCommandBuffer(commandBuffer);
+      if (result != VK_SUCCESS) {
+        lastError = vkError("vkEndCommandBuffer(halation boost milestone)", result);
+        return false;
+      }
+
+      VkFence fence = coreFrame.fence;
+      result = vkResetFences(device, 1, &fence);
+      if (result != VK_SUCCESS) {
+        lastError = vkError("vkResetFences(halation boost milestone)", result);
+        return false;
+      }
+
+      VkSubmitInfo submitInfo{};
+      submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+      submitInfo.commandBufferCount = 1;
+      submitInfo.pCommandBuffers = &commandBuffer;
+      result = backend ? backend->submit(queueIndex, submitInfo, fence) : VK_ERROR_INITIALIZATION_FAILED;
+      if (result != VK_SUCCESS) {
+        lastError = vkError("vkQueueSubmit(halation boost milestone)", result);
+        return false;
+      }
+      result = vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX);
+      if (result != VK_SUCCESS) {
+        lastError = vkError("vkWaitForFences(halation boost milestone)", result);
+        return false;
+      }
+      if (!coreFrame.halationBoostInfoReadback.mapped) {
+        lastError = "Vulkan halation boost milestone readback buffer is not mapped.";
+        return false;
+      }
+      if (!invalidateMappedScratchBuffer(
+            coreFrame.halationBoostInfoReadback,
+            4u * sizeof(float),
+            "core halation boost milestone info readback"
+          )) {
+        return false;
+      }
+      const auto *boostInfo = static_cast<const float *>(coreFrame.halationBoostInfoReadback.mapped);
+      globalMaxRaw = std::max(globalMaxRaw, boostInfo[0]);
+    }
+  }
+
+  const float rawX0 = std::clamp(
+    0.184f * std::exp2(params.halationProtectEv),
+    0.0f,
+    globalMaxRaw
+  );
+  const float boostRange = std::clamp(params.halationBoostRange, 0.0f, 1.0f);
+  const float a = std::pow(28.0f, 1.0f - boostRange);
+  const float x0 = globalMaxRaw > 0.0f ? rawX0 / globalMaxRaw : 1.0f;
+  const float denom = std::exp(a * (1.0f - x0)) - a * (1.0f - x0) - 1.0f;
+  const float k = (globalMaxRaw > 0.0f && rawX0 < globalMaxRaw && denom > 1.0e-10f)
+    ? (std::exp2(std::max(params.halationBoostEv, 0.0f)) - 1.0f) / denom
+    : 0.0f;
+  const std::array<float, 4> milestoneInfo = {globalMaxRaw, rawX0, a, k};
+  return uploadScratchBuffer(
+    coreFrame.tiledHalationBoostInfo,
+    milestoneInfo.data(),
+    static_cast<VkDeviceSize>(milestoneInfo.size() * sizeof(float)),
+    "core tiled halation boost info"
+  );
+}
+
+bool VulkanRenderer::Impl::renderTiledBootstrap(
+  const ImageView &source,
+  const MutableImageView &destination,
+  const RenderWindow &window,
+  const RenderParams &params,
+  double time
+) {
+  std::lock_guard<std::recursive_mutex> lock(renderMutex);
+  diagnostics = {};
+  diagnostics.renderSerialized = true;
+  diagnostics.tiledRendering = true;
+  lastError.clear();
+  updateSharedDiagnostics();
+
+  const int32_t fullWidth = window.x2 - window.x1;
+  const int32_t fullHeight = window.y2 - window.y1;
+  if (fullWidth <= 0 || fullHeight <= 0) {
+    return true;
+  }
+  if (!isSupportedRgba(source, destination)) {
+    lastError = "Only RGBA 16-bit half and 32-bit float images are supported by the Windows Vulkan path.";
+    return false;
+  }
+  if (!windowFitsView(source, window, fullWidth, fullHeight) ||
+      !windowFitsView(destination, window, fullWidth, fullHeight)) {
+    lastError = "The requested tiled render window does not fit inside the Vulkan source or destination image view.";
+    return false;
+  }
+  if (envFlagEnabledOrDefault("SPEKTRAFILM_VULKAN_GRAIN_PASS", true) &&
+      params.grainEnabled &&
+      params.grainModel == GrainModel::GrainSynthesis) {
+    lastError =
+      "Vulkan tiled rendering requires a full-frame pre-grain density milestone for Grain Synthesis parity; "
+      "use GPU Render Tiling: Full-frame for this setting until that milestone path is implemented.";
+    return false;
+  }
+  RenderParams tileParams = params;
+  std::vector<float> fullSourcePixels;
+  if (params.autoExposure) {
+    const uint64_t fullPixelCount =
+      static_cast<uint64_t>(fullWidth) * static_cast<uint64_t>(fullHeight);
+    if (fullPixelCount > static_cast<uint64_t>(std::numeric_limits<size_t>::max() / 4u / sizeof(float))) {
+      lastError = "The Vulkan tiled auto exposure window is too large.";
+      return false;
+    }
+    fullSourcePixels.resize(static_cast<size_t>(fullPixelCount) * 4u);
+    if (!copySourceToFloatStaging(source, window, fullWidth, fullHeight, fullSourcePixels.data())) {
+      lastError = "The requested tiled auto exposure window does not fit inside the Vulkan source image view.";
+      return false;
+    }
+    tileParams.filmExposureEv += measureAutoExposureEv(fullSourcePixels.data(), fullWidth, fullHeight, params);
+    tileParams.autoExposure = false;
+  }
+
+  uint32_t centerTileWidth = std::min<uint32_t>(
+    static_cast<uint32_t>(fullWidth),
+    envTileDimension("SPEKTRAFILM_VULKAN_TILE_WIDTH", kDefaultVulkanTileWidth)
+  );
+  uint32_t centerTileHeight = std::min<uint32_t>(
+    static_cast<uint32_t>(fullHeight),
+    envTileDimension("SPEKTRAFILM_VULKAN_TILE_HEIGHT", kDefaultVulkanTileHeight)
+  );
+  const uint32_t overlap = estimateVulkanTileOverlap(params);
+  auto growTileForOverlap = [&](uint32_t current, uint32_t fullDimension) {
+    if (overlap <= current) {
+      return current;
+    }
+    const uint32_t overlapSizedTile = overlap > std::numeric_limits<uint32_t>::max() / 2u
+      ? std::numeric_limits<uint32_t>::max()
+      : overlap * 2u;
+    return std::min<uint32_t>(fullDimension, std::max(current, overlapSizedTile));
+  };
+  centerTileWidth = growTileForOverlap(centerTileWidth, static_cast<uint32_t>(fullWidth));
+  centerTileHeight = growTileForOverlap(centerTileHeight, static_cast<uint32_t>(fullHeight));
+  const uint32_t tileColumns =
+    (static_cast<uint32_t>(fullWidth) + centerTileWidth - 1u) / centerTileWidth;
+  const uint32_t tileRows =
+    (static_cast<uint32_t>(fullHeight) + centerTileHeight - 1u) / centerTileHeight;
+  const uint32_t plannedTileCount = tileColumns * tileRows;
+  const bool halationBoostMilestoneEnabled =
+    envFlagEnabledOrDefault("SPEKTRAFILM_VULKAN_HALATION_PASS", true) &&
+    tileParams.halationEnabled &&
+    tileParams.halationBoostEv > 0.0f;
+  if (halationBoostMilestoneEnabled &&
+      !computeHalationBoostMilestone(source, window, tileParams, centerTileWidth, centerTileHeight)) {
+    const std::string milestoneError = lastError.empty() ? "unknown Vulkan halation boost milestone failure" : lastError;
+    lastError = "Vulkan tiled render failed while computing the halation boost milestone: " + milestoneError;
+    updateSharedDiagnostics();
+    return false;
+  }
+
+  const uint64_t fullSourcePixelCount =
+    static_cast<uint64_t>(fullWidth) * static_cast<uint64_t>(fullHeight);
+  const uint64_t fullSourceByteCount64 = fullSourcePixelCount * 4u * sizeof(float);
+  if (fullSourcePixelCount == 0u ||
+      fullSourceByteCount64 > static_cast<uint64_t>(std::numeric_limits<VkDeviceSize>::max()) ||
+      fullSourceByteCount64 > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+    lastError = "The Vulkan tiled full-frame source upload is too large.";
+    updateSharedDiagnostics();
+    return false;
+  }
+  const VkDeviceSize fullSourceByteCount = static_cast<VkDeviceSize>(fullSourceByteCount64);
+  if (!ensureCoreFrameResources() ||
+      !ensureUploadScratchBuffer(
+        coreFrame.sourceStaging,
+        fullSourceByteCount,
+        "core tiled full-frame source staging",
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT
+      ) ||
+      !ensurePrivateScratchBuffer(coreFrame.source, fullSourceByteCount, "core tiled full-frame source")) {
+    updateSharedDiagnostics();
+    return false;
+  }
+  if (!coreFrame.sourceStaging.mapped) {
+    lastError = "Vulkan tiled full-frame source staging buffer is not mapped.";
+    updateSharedDiagnostics();
+    return false;
+  }
+  if (!fullSourcePixels.empty()) {
+    std::memcpy(coreFrame.sourceStaging.mapped, fullSourcePixels.data(), static_cast<size_t>(fullSourceByteCount));
+  } else if (!copySourceToFloatStaging(
+               source,
+               window,
+               fullWidth,
+               fullHeight,
+               static_cast<float *>(coreFrame.sourceStaging.mapped)
+             )) {
+    lastError = "The requested tiled full-frame source upload does not fit inside the Vulkan source image view.";
+    updateSharedDiagnostics();
+    return false;
+  }
+  if (!flushMappedScratchBuffer(coreFrame.sourceStaging, fullSourceByteCount, "core tiled full-frame source staging") ||
+      !copyBufferImmediate(
+        coreFrame.sourceStaging.buffer,
+        coreFrame.source.buffer,
+        fullSourceByteCount,
+        "vkQueueSubmit(tiled full-frame source upload)"
+      )) {
+    updateSharedDiagnostics();
+    return false;
+  }
+
+  RendererDiagnostics aggregate{};
+  aggregate.renderSerialized = true;
+  aggregate.tiledRendering = true;
+  aggregate.tileCount = plannedTileCount;
+  aggregate.tileWidth = centerTileWidth;
+  aggregate.tileHeight = centerTileHeight;
+  aggregate.tileOverlap = overlap;
+  aggregate.uploadBytes = static_cast<uint64_t>(fullSourceByteCount);
+
+  const int32_t pixelBytes = destination.components * destination.bytesPerComponent;
+  bool capturedPassList = false;
+  uint32_t tileIndex = 0u;
+  for (uint32_t tileY = 0u; tileY < tileRows; ++tileY) {
+    for (uint32_t tileX = 0u; tileX < tileColumns; ++tileX, ++tileIndex) {
+      const int32_t centerX0 = window.x1 + static_cast<int32_t>(tileX * centerTileWidth);
+      const int32_t centerY0 = window.y1 + static_cast<int32_t>(tileY * centerTileHeight);
+      const int32_t centerX1 = std::min(window.x2, centerX0 + static_cast<int32_t>(centerTileWidth));
+      const int32_t centerY1 = std::min(window.y2, centerY0 + static_cast<int32_t>(centerTileHeight));
+      const int32_t centerWidth = centerX1 - centerX0;
+      const int32_t centerHeight = centerY1 - centerY0;
+      if (centerWidth <= 0 || centerHeight <= 0) {
+        continue;
+      }
+
+      const int32_t overlapPx = static_cast<int32_t>(std::min<uint32_t>(
+        overlap,
+        static_cast<uint32_t>(std::numeric_limits<int32_t>::max())
+      ));
+      const int32_t workingX0 = std::max(window.x1, centerX0 - overlapPx);
+      const int32_t workingY0 = std::max(window.y1, centerY0 - overlapPx);
+      const int32_t workingX1 = std::min(window.x2, centerX1 + overlapPx);
+      const int32_t workingY1 = std::min(window.y2, centerY1 + overlapPx);
+      const int32_t workingWidth = workingX1 - workingX0;
+      const int32_t workingHeight = workingY1 - workingY0;
+      if (workingWidth <= 0 || workingHeight <= 0) {
+        lastError = "The Vulkan tiled planner produced an empty working tile.";
+        diagnostics = aggregate;
+        updateSharedDiagnostics();
+        return false;
+      }
+
+      const uint64_t tileByteCount =
+        static_cast<uint64_t>(workingWidth) *
+        static_cast<uint64_t>(workingHeight) *
+        static_cast<uint64_t>(pixelBytes);
+      if (tileByteCount > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+        lastError = "The Vulkan tiled planner produced a tile larger than host address space.";
+        diagnostics = aggregate;
+        updateSharedDiagnostics();
+        return false;
+      }
+
+      std::vector<uint8_t> tileOutput(static_cast<size_t>(tileByteCount));
+      MutableImageView tileDestination{};
+      tileDestination.data = tileOutput.data();
+      tileDestination.x1 = workingX0;
+      tileDestination.y1 = workingY0;
+      tileDestination.width = workingWidth;
+      tileDestination.height = workingHeight;
+      tileDestination.rowBytes = workingWidth * pixelBytes;
+      tileDestination.components = destination.components;
+      tileDestination.bytesPerComponent = destination.bytesPerComponent;
+
+      activeTileContext.enabled = true;
+      activeTileContext.fullWidth = static_cast<uint32_t>(fullWidth);
+      activeTileContext.fullHeight = static_cast<uint32_t>(fullHeight);
+      activeTileContext.tileOriginX = static_cast<uint32_t>(workingX0 - window.x1);
+      activeTileContext.tileOriginY = static_cast<uint32_t>(workingY0 - window.y1);
+      activeTileContext.centerOriginX = static_cast<uint32_t>(centerX0 - workingX0);
+      activeTileContext.centerOriginY = static_cast<uint32_t>(centerY0 - workingY0);
+      activeTileContext.centerWidth = static_cast<uint32_t>(centerWidth);
+      activeTileContext.centerHeight = static_cast<uint32_t>(centerHeight);
+      activeTileContext.halationBoostMilestoneEnabled = halationBoostMilestoneEnabled;
+      activeTileContext.fullFrameSource = true;
+      const RenderWindow workingWindow{workingX0, workingY0, workingX1, workingY1};
+      const bool tileOk = renderCoreBootstrap(source, tileDestination, workingWindow, tileParams, time);
+      activeTileContext = {};
+
+      const RendererDiagnostics tileDiagnostics = diagnostics;
+      aggregate.cpuSetupMs += tileDiagnostics.cpuSetupMs;
+      aggregate.sourceCopyMs += tileDiagnostics.sourceCopyMs;
+      aggregate.commandBufferMs += tileDiagnostics.commandBufferMs;
+      aggregate.outputCopyMs += tileDiagnostics.outputCopyMs;
+      aggregate.staticAllocationBytes = std::max(aggregate.staticAllocationBytes, tileDiagnostics.staticAllocationBytes);
+      aggregate.staticAllocationCount = std::max(aggregate.staticAllocationCount, tileDiagnostics.staticAllocationCount);
+      aggregate.scratchAllocationBytes = std::max(aggregate.scratchAllocationBytes, tileDiagnostics.scratchAllocationBytes);
+      aggregate.scratchAllocationCount = std::max(aggregate.scratchAllocationCount, tileDiagnostics.scratchAllocationCount);
+      aggregate.sharedScratchAllocationBytes =
+        std::max(aggregate.sharedScratchAllocationBytes, tileDiagnostics.sharedScratchAllocationBytes);
+      aggregate.sharedScratchAllocationCount =
+        std::max(aggregate.sharedScratchAllocationCount, tileDiagnostics.sharedScratchAllocationCount);
+      aggregate.privateScratchAllocationBytes =
+        std::max(aggregate.privateScratchAllocationBytes, tileDiagnostics.privateScratchAllocationBytes);
+      aggregate.privateScratchAllocationCount =
+        std::max(aggregate.privateScratchAllocationCount, tileDiagnostics.privateScratchAllocationCount);
+      aggregate.uploadBytes = std::max(aggregate.uploadBytes, tileDiagnostics.uploadBytes);
+      aggregate.sharedBackend = tileDiagnostics.sharedBackend;
+      aggregate.sharedBackendGeneration = tileDiagnostics.sharedBackendGeneration;
+      aggregate.sharedQueueCount = tileDiagnostics.sharedQueueCount;
+      aggregate.transientCachedBytes = std::max(aggregate.transientCachedBytes, tileDiagnostics.transientCachedBytes);
+      aggregate.transientBudgetBytes = tileDiagnostics.transientBudgetBytes;
+      aggregate.passCount += tileDiagnostics.passCount;
+      aggregate.sourceNoCopy = aggregate.sourceNoCopy && tileDiagnostics.sourceNoCopy;
+      aggregate.destinationNoCopy = aggregate.destinationNoCopy && tileDiagnostics.destinationNoCopy;
+      aggregate.passGpuTimingEnabled = aggregate.passGpuTimingEnabled || tileDiagnostics.passGpuTimingEnabled;
+      aggregate.passGpuTimingAvailable = aggregate.passGpuTimingAvailable || tileDiagnostics.passGpuTimingAvailable;
+      aggregate.privateScratchEnabled = aggregate.privateScratchEnabled || tileDiagnostics.privateScratchEnabled;
+      aggregate.halationPath = aggregate.halationPath || tileDiagnostics.halationPath;
+      aggregate.cameraDiffusionPath = aggregate.cameraDiffusionPath || tileDiagnostics.cameraDiffusionPath;
+      aggregate.printDiffusionPath = aggregate.printDiffusionPath || tileDiagnostics.printDiffusionPath;
+      aggregate.dirPath = aggregate.dirPath || tileDiagnostics.dirPath;
+      aggregate.productionGrainPath = aggregate.productionGrainPath || tileDiagnostics.productionGrainPath;
+      aggregate.grainSynthesisPath = aggregate.grainSynthesisPath || tileDiagnostics.grainSynthesisPath;
+      aggregate.finalPostProcessPath = aggregate.finalPostProcessPath || tileDiagnostics.finalPostProcessPath;
+      aggregate.scannerTextureIntermediates =
+        aggregate.scannerTextureIntermediates || tileDiagnostics.scannerTextureIntermediates;
+      aggregate.halationGroupedTail = aggregate.halationGroupedTail || tileDiagnostics.halationGroupedTail;
+      aggregate.scannerMps = aggregate.scannerMps || tileDiagnostics.scannerMps;
+      aggregate.grainBlurRecurrence = tileDiagnostics.grainBlurRecurrence;
+      aggregate.diffusionGroupSize = tileDiagnostics.diffusionGroupSize;
+      aggregate.threadgroupMode = tileDiagnostics.threadgroupMode;
+      aggregate.passTimingMode = tileDiagnostics.passTimingMode;
+      aggregate.blurBackend = tileDiagnostics.blurBackend;
+      aggregate.blurDownsample = tileDiagnostics.blurDownsample;
+      aggregate.intermediatePrecision = tileDiagnostics.intermediatePrecision;
+      aggregate.diffusionClusterSigma = tileDiagnostics.diffusionClusterSigma;
+      aggregate.dirTailBackend = tileDiagnostics.dirTailBackend;
+      aggregate.densityCurveLookup = tileDiagnostics.densityCurveLookup;
+      aggregate.spectralTransmittance = tileDiagnostics.spectralTransmittance;
+      if (!capturedPassList) {
+        aggregate.passes = tileDiagnostics.passes;
+        capturedPassList = true;
+      }
+
+      RendererTileDiagnostics tileRecord{};
+      tileRecord.index = tileIndex;
+      tileRecord.outputX = centerX0;
+      tileRecord.outputY = centerY0;
+      tileRecord.outputWidth = centerWidth;
+      tileRecord.outputHeight = centerHeight;
+      tileRecord.workingX = workingX0;
+      tileRecord.workingY = workingY0;
+      tileRecord.workingWidth = workingWidth;
+      tileRecord.workingHeight = workingHeight;
+      tileRecord.overlap = overlap;
+      tileRecord.allocatedBytes = transientAllocationBytes();
+      tileRecord.submitMs = tileDiagnostics.commandBufferMs;
+      tileRecord.passCount = tileDiagnostics.passCount;
+      aggregate.tiles.push_back(tileRecord);
+
+      if (!tileOk) {
+        const std::string tileError = lastError.empty() ? "unknown Vulkan tile failure" : lastError;
+        lastError = "Vulkan tiled render failed on tile " +
+          std::to_string(tileIndex + 1u) + "/" + std::to_string(plannedTileCount) +
+          " center=[" + std::to_string(centerX0) + "," + std::to_string(centerY0) +
+          "-" + std::to_string(centerX1) + "," + std::to_string(centerY1) +
+          "] working=[" + std::to_string(workingX0) + "," + std::to_string(workingY0) +
+          "-" + std::to_string(workingX1) + "," + std::to_string(workingY1) +
+          "]: " + tileError;
+        diagnostics = aggregate;
+        updateSharedDiagnostics();
+        return false;
+      }
+
+      const RenderWindow centerWindow{centerX0, centerY0, centerX1, centerY1};
+      if (!copyMappedBytesRegionToWindow(
+            tileOutput.data(),
+            tileOutput.size(),
+            workingWidth,
+            workingHeight,
+            centerX0 - workingX0,
+            centerY0 - workingY0,
+            destination,
+            centerWindow,
+            centerWidth,
+            centerHeight
+          )) {
+        lastError = "Vulkan tiled render failed to copy a tile center into the destination image view.";
+        diagnostics = aggregate;
+        updateSharedDiagnostics();
+        return false;
+      }
+    }
+  }
+
+  diagnostics = aggregate;
+  diagnostics.tiledRendering = true;
+  diagnostics.tileCount = plannedTileCount;
+  diagnostics.tileWidth = centerTileWidth;
+  diagnostics.tileHeight = centerTileHeight;
+  diagnostics.tileOverlap = overlap;
+  refreshTransientBudgetEntry();
+  enforceTransientBudget();
+  updateSharedDiagnostics();
+  return true;
+}
+
 VulkanRenderer::VulkanRenderer() : impl_(std::make_unique<Impl>()) {}
 
 VulkanRenderer::~VulkanRenderer() = default;
@@ -6290,8 +7438,10 @@ bool VulkanRenderer::isAvailable() const {
 }
 
 const VulkanRenderDiagnostics &VulkanRenderer::lastDiagnostics() const {
-  static const VulkanRenderDiagnostics empty{};
-  return impl_ ? impl_->diagnostics : empty;
+  if (!lastRenderError_.empty()) {
+    return lastRenderDiagnostics_;
+  }
+  return impl_ ? impl_->diagnostics : lastRenderDiagnostics_;
 }
 
 const std::string &VulkanRenderer::lastError() const {
@@ -6317,10 +7467,11 @@ bool VulkanRenderer::render(
 ) {
   if (!impl_ || !impl_->available) {
     if (impl_) {
-      std::lock_guard<std::mutex> lock(impl_->renderMutex);
+      std::lock_guard<std::recursive_mutex> lock(impl_->renderMutex);
       if (impl_->lastError.empty()) {
         impl_->lastError = "Vulkan is not available on this system.";
       }
+      lastRenderDiagnostics_ = impl_->diagnostics;
       lastRenderError_ = impl_->lastError;
     }
     return false;
@@ -6330,14 +7481,25 @@ bool VulkanRenderer::render(
   if (envFlagEnabled("SPEKTRAFILM_VULKAN_COPY_PASS")) {
     ok = impl_->renderCopyValidation(source, destination, window, time);
   } else {
-    ok = impl_->renderCoreBootstrap(source, destination, window, params, time);
+    const GpuRenderTilingMode tileMode = resolveVulkanTileMode(params);
+    if (tileMode == GpuRenderTilingMode::Tiled) {
+      ok = impl_->renderTiledBootstrap(source, destination, window, params, time);
+    } else {
+      ok = impl_->renderCoreBootstrap(source, destination, window, params, time);
+    }
   }
 
   if (ok) {
+    if (impl_) {
+      lastRenderDiagnostics_ = impl_->diagnostics;
+    }
     lastRenderError_.clear();
     return true;
   }
 
+  if (impl_) {
+    lastRenderDiagnostics_ = impl_->diagnostics;
+  }
   lastRenderError_ = impl_ ? impl_->lastError : std::string();
   if (isDeviceLostError(lastRenderError_)) {
     if (impl_) {

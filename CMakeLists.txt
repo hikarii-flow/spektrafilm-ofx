@@ -24,7 +24,7 @@ endif()
 
 # Define platform-specific version variables that can be overridden via command line
 set(SPEKTRAFILM_MACOS_VERSION "0.2.6" CACHE STRING "Version number for macOS release")
-set(SPEKTRAFILM_WINDOWS_VERSION "0.1.6" CACHE STRING "Version number for Windows release")
+set(SPEKTRAFILM_WINDOWS_VERSION "0.1.7" CACHE STRING "Version number for Windows release")
 set(SPEKTRAFILM_LINUX_VERSION "${SPEKTRAFILM_WINDOWS_VERSION}" CACHE STRING "Version number for Linux developer builds")
 
 # Set the active version based on the target OS
@@ -50,6 +50,7 @@ endif()
 
 option(SPEKTRAFILM_NATIVE_FAST_MATH "Build native macOS renderer code with -ffast-math. Candidate optimization; validate with parity before release." OFF)
 option(SPEKTRAFILM_METAL_FAST_MATH "Build Metal shaders with -ffast-math. Candidate optimization; validate with parity before release." OFF)
+option(SPEKTRAFILM_METAL_PROFILE_SOURCES "Build Metal shader library with source/debug info for Xcode Metal profiling. Do not enable for release builds." OFF)
 option(SPEKTRAFILM_OFX_METAL_GPU_BUFFERS "Advertise experimental OFX Metal GPU buffer renders on macOS. CPU rendering remains the fallback." OFF)
 set(SPEKTRAFILM_METAL_LANGUAGE_STANDARD "macos-metal2.3" CACHE STRING "Metal language standard used to build SpektraFilm.metallib.")
 set(SPEKTRAFILM_METAL_EXTRA_FLAGS "" CACHE STRING "Extra flags passed to the Metal shader compiler.")
@@ -239,6 +240,9 @@ if(APPLE)
   if(SPEKTRAFILM_METAL_FAST_MATH)
     list(APPEND SPEKTRAFILM_METAL_COMPILE_FLAGS -ffast-math)
   endif()
+  if(SPEKTRAFILM_METAL_PROFILE_SOURCES)
+    list(APPEND SPEKTRAFILM_METAL_COMPILE_FLAGS -frecord-sources)
+  endif()
   if(SPEKTRAFILM_METAL_EXTRA_FLAGS)
     separate_arguments(SPEKTRAFILM_METAL_EXTRA_FLAGS_LIST NATIVE_COMMAND "${SPEKTRAFILM_METAL_EXTRA_FLAGS}")
     list(APPEND SPEKTRAFILM_METAL_COMPILE_FLAGS ${SPEKTRAFILM_METAL_EXTRA_FLAGS_LIST})
@@ -258,14 +262,26 @@ if(APPLE)
     VERBATIM
   )
 
-  add_custom_command(
-    OUTPUT "${SPEKTRAFILM_METALLIB}"
-    COMMAND xcrun -sdk macosx metallib
-            "${SPEKTRAFILM_METAL_AIR}"
-            -o "${SPEKTRAFILM_METALLIB}"
-    DEPENDS "${SPEKTRAFILM_METAL_AIR}"
-    VERBATIM
-  )
+  if(SPEKTRAFILM_METAL_PROFILE_SOURCES)
+    add_custom_command(
+      OUTPUT "${SPEKTRAFILM_METALLIB}"
+      COMMAND xcrun -sdk macosx metal
+              -frecord-sources
+              "${SPEKTRAFILM_METAL_AIR}"
+              -o "${SPEKTRAFILM_METALLIB}"
+      DEPENDS "${SPEKTRAFILM_METAL_AIR}"
+      VERBATIM
+    )
+  else()
+    add_custom_command(
+      OUTPUT "${SPEKTRAFILM_METALLIB}"
+      COMMAND xcrun -sdk macosx metallib
+              "${SPEKTRAFILM_METAL_AIR}"
+              -o "${SPEKTRAFILM_METALLIB}"
+      DEPENDS "${SPEKTRAFILM_METAL_AIR}"
+      VERBATIM
+    )
+  endif()
 
   add_custom_target(SpektraFilmMetalLibrary ALL DEPENDS "${SPEKTRAFILM_METALLIB}")
 elseif(SPEKTRAFILM_USE_VULKAN)

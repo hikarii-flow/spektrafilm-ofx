@@ -62,6 +62,7 @@ venv/
 *.dSYM/
 *.profraw
 *.profdata
+profile-runs/
 
 # Local/private project notes
 PRIVATE_README.md

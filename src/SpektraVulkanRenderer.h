@@ -34,6 +34,7 @@ public:
 private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
+  VulkanRenderDiagnostics lastRenderDiagnostics_;
   std::string lastRenderError_;
 };
 

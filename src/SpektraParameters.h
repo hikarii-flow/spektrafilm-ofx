@@ -69,6 +69,11 @@ enum class GrainModel : int32_t {
   GrainSynthesis = 2,
 };
 
+enum class GpuRenderTilingMode : int32_t {
+  LegacyFullFrame = 0,
+  Tiled = 1,
+};
+
 enum class FilmFormat : int32_t {
   Standard8 = 0,
   Super8 = 1,
@@ -130,6 +135,10 @@ struct RenderParams {
   float hdrExposureEv = 0.0f;
   HdrToneMapping hdrToneMapping = HdrToneMapping::HardClip;
   bool colorAdaptation = false;
+  bool colorAdaptationInputCompression = true;
+  bool colorAdaptationCurveSmoothing = true;
+  bool colorAdaptationOutputLightnessCompression = true;
+  bool colorAdaptationOutputChromaCompression = true;
   int32_t film = 2;
   int32_t paper = 3;
   PrintTimingMode printTiming = PrintTimingMode::FilteredEnlarger;
@@ -185,7 +194,7 @@ struct RenderParams {
   float dirCouplersGammaBToR = 0.168f;
   float dirCouplersGammaBToG = 0.226f;
 
-  bool grainEnabled = true;
+  bool grainEnabled = false;
   GrainModel grainModel = GrainModel::Preview;
   FilmFormat filmFormat = FilmFormat::Standard35;
   float grainAmount = 1.0f;
@@ -281,7 +290,28 @@ struct RenderParams {
   float scannerMtf50LpMm = 60.0f;
   float scannerUnsharpRadiusUm = 5.0f;
   float scannerUnsharpAmount = 0.7f;
+
+  GpuRenderTilingMode gpuRenderTiling = GpuRenderTilingMode::LegacyFullFrame;
 };
+
+enum ColorAdaptationFlag : uint32_t {
+  kColorAdaptationInputCompression = 1u << 0u,
+  kColorAdaptationCurveSmoothing = 1u << 1u,
+  kColorAdaptationOutputLightnessCompression = 1u << 2u,
+  kColorAdaptationOutputChromaCompression = 1u << 3u,
+};
+
+inline uint32_t colorAdaptationFlags(const RenderParams &params) {
+  if (!params.colorAdaptation) {
+    return 0u;
+  }
+  uint32_t flags = 0u;
+  flags |= params.colorAdaptationInputCompression ? kColorAdaptationInputCompression : 0u;
+  flags |= params.colorAdaptationCurveSmoothing ? kColorAdaptationCurveSmoothing : 0u;
+  flags |= params.colorAdaptationOutputLightnessCompression ? kColorAdaptationOutputLightnessCompression : 0u;
+  flags |= params.colorAdaptationOutputChromaCompression ? kColorAdaptationOutputChromaCompression : 0u;
+  return flags;
+}
 
 struct ImageView {
   const void *data = nullptr;

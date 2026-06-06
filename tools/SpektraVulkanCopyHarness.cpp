@@ -43,6 +43,11 @@ struct Options {
   bool scannerPostPass = false;
   bool previewGrainPass = false;
   bool productionGrainPass = false;
+  bool grainSynthesisPass = false;
+  std::string tileMode = "tiled";
+  int tileWidth = 512;
+  int tileHeight = 256;
+  bool compareTileParity = false;
   int sharedBackendInstances = 1;
   bool sharedBackendConcurrent = false;
   bool memoryBudgetTest = false;
@@ -66,7 +71,9 @@ void printUsage(const char *name) {
     << "       [--halation-pass] [--camera-diffusion-pass]\n"
     << "       [--print-diffusion-pass|--diffusion-pass]\n"
     << "       [--dir-pass] [--scanner-post-pass]\n"
-    << "       [--preview-grain-pass|--production-grain-pass]\n"
+    << "       [--preview-grain-pass|--production-grain-pass|--grain-synthesis-pass]\n"
+    << "       [--tile-mode tiled|legacy] [--tile-size WIDTHxHEIGHT]\n"
+    << "       [--compare-tile-parity]\n"
     << "       [--shared-backend-instances N] [--shared-backend-concurrent]\n"
     << "       [--memory-budget-test]\n"
     << "       [--input-pattern synthetic|ramp] [--input-ramp]\n"
@@ -155,6 +162,40 @@ bool parseArgs(int argc, char **argv, Options &options) {
     } else if (arg == "--production-grain-pass") {
       options.corePass = true;
       options.productionGrainPass = true;
+    } else if (arg == "--grain-synthesis-pass") {
+      options.corePass = true;
+      options.grainSynthesisPass = true;
+    } else if (arg == "--tile-mode") {
+      const char *value = requireValue("--tile-mode");
+      if (!value) {
+        return false;
+      }
+      options.tileMode = value;
+      if (options.tileMode != "tiled" && options.tileMode != "legacy") {
+        std::cerr << "--tile-mode expects tiled or legacy.\n";
+        return false;
+      }
+    } else if (arg == "--tile-size") {
+      const char *value = requireValue("--tile-size");
+      if (!value) {
+        return false;
+      }
+      const char *x = std::strchr(value, 'x');
+      if (!x) {
+        x = std::strchr(value, 'X');
+      }
+      if (!x) {
+        std::cerr << "--tile-size expects WIDTHxHEIGHT.\n";
+        return false;
+      }
+      std::string widthText(value, static_cast<size_t>(x - value));
+      std::string heightText(x + 1);
+      if (!parseInt(widthText.c_str(), options.tileWidth) || !parseInt(heightText.c_str(), options.tileHeight)) {
+        return false;
+      }
+    } else if (arg == "--compare-tile-parity") {
+      options.compareTileParity = true;
+      options.corePass = true;
     } else if (arg == "--shared-backend-instances") {
       const char *value = requireValue("--shared-backend-instances");
       if (!value || !parseInt(value, options.sharedBackendInstances)) {
@@ -183,8 +224,12 @@ bool parseArgs(int argc, char **argv, Options &options) {
     std::cerr << "--half-only and --float-only are mutually exclusive.\n";
     return false;
   }
-  if (options.previewGrainPass && options.productionGrainPass) {
-    std::cerr << "--preview-grain-pass and --production-grain-pass are mutually exclusive.\n";
+  const int grainModeCount =
+    (options.previewGrainPass ? 1 : 0) +
+    (options.productionGrainPass ? 1 : 0) +
+    (options.grainSynthesisPass ? 1 : 0);
+  if (grainModeCount > 1) {
+    std::cerr << "--preview-grain-pass, --production-grain-pass, and --grain-synthesis-pass are mutually exclusive.\n";
     return false;
   }
   return true;
@@ -896,7 +941,8 @@ spektrafilm::RenderParams makeCoreHarnessParams(
   bool dirPass,
   bool scannerPostPass,
   bool previewGrainPass,
-  bool productionGrainPass
+  bool productionGrainPass,
+  bool grainSynthesisPass
 ) {
   spektrafilm::RenderParams params{};
   params.inputColorSpace = spektrafilm::ColorSpace::DisplayP3;
@@ -934,16 +980,23 @@ spektrafilm::RenderParams makeCoreHarnessParams(
   params.scannerMtf50LpMm = scannerPostPass ? 80.0f : params.scannerMtf50LpMm;
   params.scannerUnsharpRadiusUm = scannerPostPass ? 8.0f : params.scannerUnsharpRadiusUm;
   params.scannerUnsharpAmount = scannerPostPass ? 0.35f : params.scannerUnsharpAmount;
-  const bool grainPass = previewGrainPass || productionGrainPass;
+  const bool grainPass = previewGrainPass || productionGrainPass || grainSynthesisPass;
   params.grainEnabled = grainPass;
-  params.grainModel = productionGrainPass ? spektrafilm::GrainModel::Production : spektrafilm::GrainModel::Preview;
+  params.grainModel = grainSynthesisPass
+    ? spektrafilm::GrainModel::GrainSynthesis
+    : (productionGrainPass ? spektrafilm::GrainModel::Production : spektrafilm::GrainModel::Preview);
   params.grainAmount = grainPass ? 0.85f : params.grainAmount;
   params.grainSaturation = grainPass ? 0.75f : params.grainSaturation;
-  params.grainSublayersEnabled = productionGrainPass;
+  params.grainSublayersEnabled = productionGrainPass || grainSynthesisPass;
   params.grainSubLayerCount = previewGrainPass ? 4 : params.grainSubLayerCount;
   params.grainParticleAreaUm2 = grainPass ? 0.12f : params.grainParticleAreaUm2;
   params.grainFinalBlurUm = grainPass ? 6.5f : params.grainFinalBlurUm;
-  params.grainBlurDyeCloudsUm = productionGrainPass ? 1.0f : params.grainBlurDyeCloudsUm;
+  params.grainBlurDyeCloudsUm = (productionGrainPass || grainSynthesisPass) ? 1.0f : params.grainBlurDyeCloudsUm;
+  params.grainSynthesisQuality = grainSynthesisPass ? 0.75f : params.grainSynthesisQuality;
+  params.grainSynthesisSamples = grainSynthesisPass ? 64 : params.grainSynthesisSamples;
+  params.grainSynthesisMeanRadiusUm = grainSynthesisPass ? 0.22f : params.grainSynthesisMeanRadiusUm;
+  params.grainSynthesisObservationSigmaUm = grainSynthesisPass ? 0.65f : params.grainSynthesisObservationSigmaUm;
+  params.grainSynthesisMaxGrainsPerCell = grainSynthesisPass ? 24 : params.grainSynthesisMaxGrainsPerCell;
   params.grainSeed = grainPass ? 37u : params.grainSeed;
   params.grainAnimate = false;
   (void)printScanPass;
@@ -966,7 +1019,8 @@ bool runCoreCase(
   bool dirPass,
   bool scannerPostPass,
   bool previewGrainPass,
-  bool productionGrainPass
+  bool productionGrainPass,
+  bool grainSynthesisPass
 ) {
   constexpr int components = 4;
   const int pixelBytes = components * bytesPerComponent;
@@ -1018,9 +1072,10 @@ bool runCoreCase(
     dirPass,
     scannerPostPass,
     previewGrainPass,
-    productionGrainPass
+    productionGrainPass,
+    grainSynthesisPass
   );
-  const bool grainPass = previewGrainPass || productionGrainPass;
+  const bool grainPass = previewGrainPass || productionGrainPass || grainSynthesisPass;
   const spektrafilm::ProfileCurveSet *curves = spektrafilm::filmProfileCurves(params.film);
   if (!curves) {
     curves = spektrafilm::filmProfileCurves(static_cast<int32_t>(spektrafilm::kSpektraDefaultFilmIndex));
@@ -1029,7 +1084,7 @@ bool runCoreCase(
     std::cerr << "Generated film density curves are unavailable.\n";
     return false;
   }
-  if (productionGrainPass && (!curves->densityCurveLayers || !curves->densityCurveLayerMaxima)) {
+  if ((productionGrainPass || grainSynthesisPass) && (!curves->densityCurveLayers || !curves->densityCurveLayerMaxima)) {
     std::cerr << "Generated film grain layer data is unavailable.\n";
     return false;
   }
@@ -1158,7 +1213,7 @@ bool runCoreCase(
     : 0u;
   const uint32_t dirExtraPassCount = dirPass ? 11u : 0u;
   const uint32_t scannerPostExtraPassCount = scannerPostPass ? 9u : 0u;
-  const uint32_t grainExtraPassCount = previewGrainPass ? 1u : (productionGrainPass ? 10u : 0u);
+  const uint32_t grainExtraPassCount = previewGrainPass ? 1u : ((productionGrainPass || grainSynthesisPass) ? 10u : 0u);
   const uint32_t expectedPassCount =
     2u +
     cameraDiffusionExtraPassCount +
@@ -1167,8 +1222,10 @@ bool runCoreCase(
     grainExtraPassCount +
     (printScanPass ? (printDiffusionPass ? printDiffusionExtraPassCount : 1u) : 0u) +
     scannerPostExtraPassCount;
-  if (diagnostics.passCount != expectedPassCount) {
-    std::cerr << "Expected " << expectedPassCount << " core bootstrap passes, saw " << diagnostics.passCount << ".\n";
+  const uint32_t expectedTotalPassCount =
+    expectedPassCount * (diagnostics.tiledRendering ? std::max(diagnostics.tileCount, 1u) : 1u);
+  if (diagnostics.passCount != expectedTotalPassCount) {
+    std::cerr << "Expected " << expectedTotalPassCount << " core bootstrap passes, saw " << diagnostics.passCount << ".\n";
     return false;
   }
   if (iterations > 1 && diagnostics.scratchAllocationCount != 0) {
@@ -1188,7 +1245,12 @@ bool runCoreCase(
     << ", print_diffusion=" << (printDiffusionPass ? "on" : "off")
     << ", dir=" << (dirPass ? "on" : "off")
     << ", scanner_post=" << (scannerPostPass ? "on" : "off")
-    << ", grain=" << (productionGrainPass ? "production" : (previewGrainPass ? "preview" : "off"))
+    << ", grain=" << (grainSynthesisPass ? "synthesis" : (productionGrainPass ? "production" : (previewGrainPass ? "preview" : "off")))
+    << ", tile_mode=" << (diagnostics.tiledRendering ? "tiled" : "legacy")
+    << ", tile_count=" << diagnostics.tileCount
+    << ", tile_size=" << diagnostics.tileWidth << "x" << diagnostics.tileHeight
+    << ", tile_overlap=" << diagnostics.tileOverlap
+    << ", tile_records=" << diagnostics.tiles.size()
     << ", passes=" << diagnostics.passCount
     << ", source_copy_ms=" << diagnostics.sourceCopyMs
     << ", cpu_setup_ms=" << diagnostics.cpuSetupMs
@@ -1199,6 +1261,209 @@ bool runCoreCase(
     << ", scratch_allocs=" << diagnostics.scratchAllocationCount
     << ", scratch_bytes=" << diagnostics.scratchAllocationBytes
     << "\n";
+  return true;
+}
+
+float readRenderedComponent(
+  const std::vector<uint8_t> &image,
+  int rowBytes,
+  int bytesPerComponent,
+  int x,
+  int y,
+  int channel
+) {
+  const uint8_t *ptr = image.data() +
+    static_cast<size_t>(y) * static_cast<size_t>(rowBytes) +
+    static_cast<size_t>(x * 4 + channel) * static_cast<size_t>(bytesPerComponent);
+  if (bytesPerComponent == 4) {
+    float value = 0.0f;
+    std::memcpy(&value, ptr, sizeof(value));
+    return value;
+  }
+  uint16_t half = 0u;
+  std::memcpy(&half, ptr, sizeof(half));
+  return halfToFloat(half);
+}
+
+uint16_t readRenderedHalfComponent(
+  const std::vector<uint8_t> &image,
+  int rowBytes,
+  int x,
+  int y,
+  int channel
+) {
+  uint16_t half = 0u;
+  const uint8_t *ptr = image.data() +
+    static_cast<size_t>(y) * static_cast<size_t>(rowBytes) +
+    static_cast<size_t>(x * 4 + channel) * sizeof(uint16_t);
+  std::memcpy(&half, ptr, sizeof(half));
+  return half;
+}
+
+bool runTileParityCase(
+  spektrafilm::Renderer &renderer,
+  int width,
+  int height,
+  int bytesPerComponent,
+  SourcePattern sourcePattern,
+  spektrafilm::RgbToRawMethod method,
+  const Options &options
+) {
+  constexpr int components = 4;
+  const int pixelBytes = components * bytesPerComponent;
+  const int sourceRowBytes = width * pixelBytes + 16;
+  const int destinationRowBytes = width * pixelBytes + 32;
+  std::vector<uint8_t> source(static_cast<size_t>(height) * static_cast<size_t>(sourceRowBytes), 0);
+  std::vector<uint8_t> legacyDestination(static_cast<size_t>(height) * static_cast<size_t>(destinationRowBytes), 0xcd);
+  std::vector<uint8_t> tiledDestination(static_cast<size_t>(height) * static_cast<size_t>(destinationRowBytes), 0xcd);
+
+  for (int y = 0; y < height; ++y) {
+    uint8_t *row = source.data() + static_cast<size_t>(y) * static_cast<size_t>(sourceRowBytes);
+    for (int x = 0; x < width; ++x) {
+      if (bytesPerComponent == 4) {
+        auto *pixel = reinterpret_cast<float *>(row + static_cast<size_t>(x) * 4u * sizeof(float));
+        for (int c = 0; c < 4; ++c) {
+          pixel[c] = sourceValue(x, y, c, width, height, sourcePattern);
+        }
+      } else {
+        auto *pixel = reinterpret_cast<uint16_t *>(row + static_cast<size_t>(x) * 4u * sizeof(uint16_t));
+        for (int c = 0; c < 4; ++c) {
+          pixel[c] = floatToHalf(sourceValue(x, y, c, width, height, sourcePattern));
+        }
+      }
+    }
+  }
+
+  spektrafilm::ImageView sourceView{};
+  sourceView.data = source.data();
+  sourceView.width = width;
+  sourceView.height = height;
+  sourceView.rowBytes = sourceRowBytes;
+  sourceView.components = components;
+  sourceView.bytesPerComponent = bytesPerComponent;
+
+  auto makeDestinationView = [&](std::vector<uint8_t> &buffer) {
+    spektrafilm::MutableImageView view{};
+    view.data = buffer.data();
+    view.width = width;
+    view.height = height;
+    view.rowBytes = destinationRowBytes;
+    view.components = components;
+    view.bytesPerComponent = bytesPerComponent;
+    return view;
+  };
+
+  spektrafilm::RenderWindow window{0, 0, width, height};
+  spektrafilm::RenderParams params = makeCoreHarnessParams(
+    method,
+    options.printScanPass,
+    options.halationPass,
+    options.cameraDiffusionPass,
+    options.printDiffusionPass,
+    options.dirPass,
+    options.scannerPostPass,
+    options.previewGrainPass,
+    options.productionGrainPass,
+    options.grainSynthesisPass
+  );
+
+  setEnv("SPEKTRAFILM_VULKAN_TILE_MODE", "legacy");
+  params.gpuRenderTiling = spektrafilm::GpuRenderTilingMode::LegacyFullFrame;
+  spektrafilm::MutableImageView legacyView = makeDestinationView(legacyDestination);
+  if (!renderer.render(sourceView, legacyView, window, params, 0.0)) {
+    std::cerr << "Legacy parity render failed: " << renderer.lastError() << "\n";
+    return false;
+  }
+  const spektrafilm::RendererDiagnostics legacyDiagnostics = renderer.lastDiagnostics();
+
+  setEnv("SPEKTRAFILM_VULKAN_TILE_MODE", "tiled");
+  const std::string tileWidthText = std::to_string(options.tileWidth);
+  const std::string tileHeightText = std::to_string(options.tileHeight);
+  setEnv("SPEKTRAFILM_VULKAN_TILE_WIDTH", tileWidthText.c_str());
+  setEnv("SPEKTRAFILM_VULKAN_TILE_HEIGHT", tileHeightText.c_str());
+  params.gpuRenderTiling = spektrafilm::GpuRenderTilingMode::Tiled;
+  spektrafilm::MutableImageView tiledView = makeDestinationView(tiledDestination);
+  if (!renderer.render(sourceView, tiledView, window, params, 0.0)) {
+    std::cerr << "Tiled parity render failed: " << renderer.lastError() << "\n";
+    return false;
+  }
+  const spektrafilm::RendererDiagnostics tiledDiagnostics = renderer.lastDiagnostics();
+
+  double sumSquared = 0.0;
+  double maxAbs = 0.0;
+  double seamMaxAbs = 0.0;
+  double nonSeamMaxAbs = 0.0;
+  uint32_t maxHalfUlp = 0u;
+  uint64_t sampleCount = 0u;
+  const int tileWidth = std::max(options.tileWidth, 1);
+  const int tileHeight = std::max(options.tileHeight, 1);
+  for (int y = 0; y < height; ++y) {
+    const bool ySeam = y > 0 && (y % tileHeight == 0 || ((y + 1) % tileHeight == 0));
+    for (int x = 0; x < width; ++x) {
+      const bool seam = ySeam || (x > 0 && (x % tileWidth == 0 || ((x + 1) % tileWidth == 0)));
+      for (int c = 0; c < 4; ++c) {
+        const float legacy = readRenderedComponent(legacyDestination, destinationRowBytes, bytesPerComponent, x, y, c);
+        const float tiled = readRenderedComponent(tiledDestination, destinationRowBytes, bytesPerComponent, x, y, c);
+        const double delta = static_cast<double>(std::abs(tiled - legacy));
+        maxAbs = std::max(maxAbs, delta);
+        sumSquared += delta * delta;
+        ++sampleCount;
+        if (seam) {
+          seamMaxAbs = std::max(seamMaxAbs, delta);
+        } else {
+          nonSeamMaxAbs = std::max(nonSeamMaxAbs, delta);
+        }
+        if (bytesPerComponent == 2) {
+          const uint16_t legacyHalf = readRenderedHalfComponent(legacyDestination, destinationRowBytes, x, y, c);
+          const uint16_t tiledHalf = readRenderedHalfComponent(tiledDestination, destinationRowBytes, x, y, c);
+          const uint32_t halfDiff = legacyHalf > tiledHalf
+            ? static_cast<uint32_t>(legacyHalf - tiledHalf)
+            : static_cast<uint32_t>(tiledHalf - legacyHalf);
+          maxHalfUlp = std::max(maxHalfUlp, halfDiff);
+        }
+      }
+    }
+    const uint8_t *legacyPadding =
+      legacyDestination.data() + static_cast<size_t>(y) * static_cast<size_t>(destinationRowBytes) +
+      static_cast<size_t>(width) * static_cast<size_t>(pixelBytes);
+    const uint8_t *tiledPadding =
+      tiledDestination.data() + static_cast<size_t>(y) * static_cast<size_t>(destinationRowBytes) +
+      static_cast<size_t>(width) * static_cast<size_t>(pixelBytes);
+    if (!std::all_of(legacyPadding, legacyPadding + (destinationRowBytes - width * pixelBytes), [](uint8_t value) { return value == 0xcd; }) ||
+        !std::all_of(tiledPadding, tiledPadding + (destinationRowBytes - width * pixelBytes), [](uint8_t value) { return value == 0xcd; })) {
+      std::cerr << "Destination row padding was modified during tile parity at row " << y << ".\n";
+      return false;
+    }
+  }
+
+  const double rms = sampleCount > 0u ? std::sqrt(sumSquared / static_cast<double>(sampleCount)) : 0.0;
+  const bool seamOk = seamMaxAbs <= std::max(nonSeamMaxAbs, bytesPerComponent == 4 ? 2.0e-5 : 1.0e-3);
+  const bool valueOk = bytesPerComponent == 4
+    ? (maxAbs <= 2.0e-5 && rms <= 2.0e-6)
+    : (maxHalfUlp <= 1u);
+
+  std::cout
+    << bytesPerComponent * 8 << "-bit RGBA tile parity: "
+    << width << "x" << height
+    << ", method=" << methodLabel(method)
+    << ", input=" << sourcePatternLabel(sourcePattern)
+    << ", tile_size=" << options.tileWidth << "x" << options.tileHeight
+    << ", tile_count=" << tiledDiagnostics.tileCount
+    << ", tile_overlap=" << tiledDiagnostics.tileOverlap
+    << ", tile_records=" << tiledDiagnostics.tiles.size()
+    << ", max_abs=" << maxAbs
+    << ", rms=" << rms
+    << ", seam_max_abs=" << seamMaxAbs
+    << ", non_seam_max_abs=" << nonSeamMaxAbs
+    << ", half_ulp_max=" << maxHalfUlp
+    << ", legacy_scratch_bytes=" << legacyDiagnostics.scratchAllocationBytes
+    << ", tiled_scratch_bytes=" << tiledDiagnostics.scratchAllocationBytes
+    << "\n";
+
+  if (!valueOk || !seamOk) {
+    std::cerr << "Tile parity thresholds failed.\n";
+    return false;
+  }
   return true;
 }
 
@@ -1245,7 +1510,8 @@ bool runSharedBackendCase(const Options &options) {
         options.dirPass,
         options.scannerPostPass,
         options.previewGrainPass,
-        options.productionGrainPass
+        options.productionGrainPass,
+        options.grainSynthesisPass
       );
     }
     return runCopyCase(
@@ -1356,7 +1622,15 @@ int main(int argc, char **argv) {
   setEnv("SPEKTRAFILM_VULKAN_DIFFUSION_PASS", (options.cameraDiffusionPass || options.printDiffusionPass) ? "1" : "0");
   setEnv("SPEKTRAFILM_VULKAN_DIR_PASS", options.dirPass ? "1" : "0");
   setEnv("SPEKTRAFILM_VULKAN_SCANNER_POST_PASS", options.scannerPostPass ? "1" : "0");
-  setEnv("SPEKTRAFILM_VULKAN_GRAIN_PASS", (options.previewGrainPass || options.productionGrainPass) ? "1" : "0");
+  setEnv(
+    "SPEKTRAFILM_VULKAN_GRAIN_PASS",
+    (options.previewGrainPass || options.productionGrainPass || options.grainSynthesisPass) ? "1" : "0"
+  );
+  setEnv("SPEKTRAFILM_VULKAN_TILE_MODE", options.tileMode.c_str());
+  const std::string tileWidthText = std::to_string(options.tileWidth);
+  const std::string tileHeightText = std::to_string(options.tileHeight);
+  setEnv("SPEKTRAFILM_VULKAN_TILE_WIDTH", tileWidthText.c_str());
+  setEnv("SPEKTRAFILM_VULKAN_TILE_HEIGHT", tileHeightText.c_str());
   if (!options.resourceDir.empty()) {
     setEnv("SPEKTRAFILM_RESOURCE_DIR", options.resourceDir.c_str());
   }
@@ -1376,6 +1650,32 @@ int main(int argc, char **argv) {
   }
 
   bool ok = true;
+  if (options.compareTileParity) {
+    if (!options.floatOnly) {
+      ok = runTileParityCase(
+        *renderer,
+        options.width,
+        options.height,
+        2,
+        options.sourcePattern,
+        spektrafilm::RgbToRawMethod::Hanatos2026,
+        options
+      ) && ok;
+    }
+    if (!options.halfOnly) {
+      ok = runTileParityCase(
+        *renderer,
+        options.width,
+        options.height,
+        4,
+        options.sourcePattern,
+        spektrafilm::RgbToRawMethod::Hanatos2026,
+        options
+      ) && ok;
+    }
+    return ok ? 0 : 1;
+  }
+
   if (!options.floatOnly) {
     if (options.corePass) {
       ok = runCoreCase(
@@ -1394,7 +1694,8 @@ int main(int argc, char **argv) {
         options.dirPass,
         options.scannerPostPass,
         options.previewGrainPass,
-        options.productionGrainPass
+        options.productionGrainPass,
+        options.grainSynthesisPass
       ) && ok;
       ok = runCoreCase(
         *renderer,
@@ -1412,7 +1713,8 @@ int main(int argc, char **argv) {
         options.dirPass,
         options.scannerPostPass,
         options.previewGrainPass,
-        options.productionGrainPass
+        options.productionGrainPass,
+        options.grainSynthesisPass
       ) && ok;
       ok = runCoreCase(
         *renderer,
@@ -1430,7 +1732,8 @@ int main(int argc, char **argv) {
         options.dirPass,
         options.scannerPostPass,
         options.previewGrainPass,
-        options.productionGrainPass
+        options.productionGrainPass,
+        options.grainSynthesisPass
       ) && ok;
     } else {
       ok = runCopyCase(*renderer, options.width, options.height, 2, options.iterations) && ok;
@@ -1454,7 +1757,8 @@ int main(int argc, char **argv) {
         options.dirPass,
         options.scannerPostPass,
         options.previewGrainPass,
-        options.productionGrainPass
+        options.productionGrainPass,
+        options.grainSynthesisPass
       ) && ok;
       ok = runCoreCase(
         *renderer,
@@ -1472,7 +1776,8 @@ int main(int argc, char **argv) {
         options.dirPass,
         options.scannerPostPass,
         options.previewGrainPass,
-        options.productionGrainPass
+        options.productionGrainPass,
+        options.grainSynthesisPass
       ) && ok;
       ok = runCoreCase(
         *renderer,
@@ -1490,7 +1795,8 @@ int main(int argc, char **argv) {
         options.dirPass,
         options.scannerPostPass,
         options.previewGrainPass,
-        options.productionGrainPass
+        options.productionGrainPass,
+        options.grainSynthesisPass
       ) && ok;
     } else {
       ok = runCopyCase(*renderer, options.width, options.height, 4, options.iterations) && ok;

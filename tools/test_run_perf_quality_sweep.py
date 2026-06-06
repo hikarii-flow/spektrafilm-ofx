@@ -40,6 +40,15 @@ class PerfQualitySweepTests(unittest.TestCase):
     self.assertEqual(fast_exp.env["SPEKTRAFILM_SPECTRAL_TRANSMITTANCE"], "fast-exp")
     self.assertEqual(fast_exp.quality_policy, "report_only")
 
+  def test_final_core_manifest_never_promotes_staged_diagnostic(self) -> None:
+    manifest = Path(__file__).resolve().parent / "perf_candidates_final_core.json"
+    candidates = sweep.load_candidate_configs([manifest])
+    by_name = {candidate.name: candidate for candidate in candidates}
+    self.assertEqual(by_name["staged-final-core-diagnostic"].quality_policy, "report_only")
+    self.assertTrue(by_name["staged-final-core-diagnostic"].quality_required)
+    self.assertEqual(by_name["staged-final-core-diagnostic"].env["SPEKTRAFILM_FINAL_CORE_MODE"], "staged")
+    self.assertEqual(by_name["final-core-uniform-linear"].quality_policy, "report_only")
+
   def test_case_list_parsing(self) -> None:
     self.assertEqual(
         sweep.parse_case_tuple("scanner-only, dir-only"),
